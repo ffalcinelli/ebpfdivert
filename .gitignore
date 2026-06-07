@@ -1,28 +1,16 @@
-# Prerequisites
-*.d
-
-# Object files
+# Build artifacts
 *.o
 *.ko
 *.obj
 *.elf
+*.skel.h
+test_bpf
 
-# Linker output
-*.ilk
-*.map
-*.exp
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Libraries
+# Libraries and Shared Objects
 *.lib
 *.a
 *.la
 *.lo
-
-# Shared objects (inc. Windows DLLs)
 *.dll
 *.so
 *.so.*
@@ -36,11 +24,22 @@
 *.x86_64
 *.hex
 
-# Debug files
+# Debug and Dependency files
+*.d
 *.dSYM/
 *.su
 *.idb
 *.pdb
+*.dwo
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# Precompiled Headers
+*.gch
+*.pch
 
 # Kernel Module Compile Results
 *.mod*
@@ -51,5 +50,9 @@ Module.symvers
 Mkfile.old
 dkms.conf
 
-# debug information files
-*.dwo
+# Development Environment
+.vagrant/
+.vscode/
+.idea/
+*.swp
+*~

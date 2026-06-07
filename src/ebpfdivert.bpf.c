@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR LGPL-3.0-or-later
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
@@ -273,4 +274,4 @@ int tc_divert_egress(struct __sk_buff *skb) {
     return process_packet(skb, 2);
 }
 
-char _license[] SEC("license") = "Dual LGPL/GPL";
+char _license[] SEC("license") = "Dual GPL/LGPL";
