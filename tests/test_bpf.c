@@ -9,6 +9,10 @@
 #include <netinet/tcp.h>
 #include <linux/pkt_cls.h>
 
+static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
+    return vfprintf(stderr, format, args);
+}
+
 #define MATCH_DST_PORT       (1 << 3)
 #define MATCH_ENABLED        (1 << 8)
 #define MATCH_SNIFF          (1 << 9)
@@ -76,6 +80,7 @@ void test_packet(int prog_fd, const char *msg, int expected_retval, __u16 dport)
 }
 
 int main(int argc, char **argv) {
+    libbpf_set_print(libbpf_print_fn);
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <bpf_object_file>\n", argv[0]);
         return 1;
