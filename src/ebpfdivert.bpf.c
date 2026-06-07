@@ -12,7 +12,7 @@
 #define STAT_DROPPED  1
 #define STAT_SNIFFED  2
 
-struct pydivert_pkt_header {
+struct divert_pkt_header {
     __u32 pkt_len;
     __u32 ifindex;
     __u16 direction;
@@ -20,8 +20,8 @@ struct pydivert_pkt_header {
     __u32 pad;
 };
 
-struct pydivert_packet_buffer {
-    struct pydivert_pkt_header header;
+struct divert_packet_buffer {
+    struct divert_pkt_header header;
     __u8 data[2048];
 };
 
@@ -238,7 +238,7 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
         return TC_ACT_SHOT;
     }
 
-    struct pydivert_packet_buffer *buf = bpf_ringbuf_reserve(&pcap_ringbuf, sizeof(struct pydivert_packet_buffer), 0);
+    struct divert_packet_buffer *buf = bpf_ringbuf_reserve(&pcap_ringbuf, sizeof(struct divert_packet_buffer), 0);
     if (!buf) return TC_ACT_UNSPEC;
 
     buf->header.pkt_len = skb->len;
