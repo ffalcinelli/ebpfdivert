@@ -2,6 +2,12 @@
 #ifndef EBPFDIVERT_SHARED_H
 #define EBPFDIVERT_SHARED_H
 
+#ifdef __bpf__
+// Kernel BPF compilation: types are provided by vmlinux.h
+#else
+#include <linux/types.h>
+#endif
+
 #define MAX_RULES 64
 
 #define STAT_DIVERTED     0

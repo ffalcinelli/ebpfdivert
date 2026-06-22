@@ -9,8 +9,10 @@ TEST_EXE = test_bpf
 TEST_SRC = tests/test_bpf.c
 CLI_EXE = ebpfdivert-cli
 CLI_SRC = src/ebpfdivert-cli.c
+LIB_SO = libebpfdivert.so
+LIB_SRC = src/ebpfdivert.c
 
-all: $(BPF_OBJ) $(TEST_EXE) $(CLI_EXE)
+all: $(BPF_OBJ) $(TEST_EXE) $(LIB_SO) $(CLI_EXE)
 
 $(BPF_OBJ): $(BPF_SRC) include/vmlinux.h
 	$(CLANG) $(CFLAGS) -target bpf $(INCLUDES) -c $< -o $@
@@ -18,8 +20,11 @@ $(BPF_OBJ): $(BPF_SRC) include/vmlinux.h
 $(TEST_EXE): $(TEST_SRC)
 	gcc $(CFLAGS) $(INCLUDES) $< $(LIBBPF_LIBS) -o $@
 
-$(CLI_EXE): $(CLI_SRC)
-	gcc $(CFLAGS) $(INCLUDES) $< $(LIBBPF_LIBS) -o $@
+$(LIB_SO): $(LIB_SRC)
+	gcc $(CFLAGS) $(INCLUDES) -fPIC -shared $< $(LIBBPF_LIBS) -o $@
+
+$(CLI_EXE): $(CLI_SRC) $(LIB_SO)
+	gcc $(CFLAGS) $(INCLUDES) $< -L. -lebpfdivert -Wl,-rpath,. -o $@
 
 clean:
-	rm -f $(BPF_OBJ) $(TEST_EXE) $(CLI_EXE)
+	rm -f $(BPF_OBJ) $(TEST_EXE) $(LIB_SO) $(CLI_EXE)
