@@ -42,10 +42,22 @@ struct filter_rule {
     __u32 dst_ip;
     __u32 src_mask;
     __u32 dst_mask;
-    __u16 src_port_start;
-    __u16 src_port_end;
-    __u16 dst_port_start;
-    __u16 dst_port_end;
+    union {
+        __u16 src_port_start;
+        __u16 icmp_type_start;
+    };
+    union {
+        __u16 src_port_end;
+        __u16 icmp_type_end;
+    };
+    union {
+        __u16 dst_port_start;
+        __u16 icmp_code_start;
+    };
+    union {
+        __u16 dst_port_end;
+        __u16 icmp_code_end;
+    };
     __u16 match_mask;
     __u16 invert_mask;
     __u8  proto;
@@ -61,10 +73,22 @@ struct filter_rule_ipv6 {
     __u8  dst_ip[16];
     __u8  src_mask[16];
     __u8  dst_mask[16];
-    __u16 src_port_start;
-    __u16 src_port_end;
-    __u16 dst_port_start;
-    __u16 dst_port_end;
+    union {
+        __u16 src_port_start;
+        __u16 icmp_type_start;
+    };
+    union {
+        __u16 src_port_end;
+        __u16 icmp_type_end;
+    };
+    union {
+        __u16 dst_port_start;
+        __u16 icmp_code_start;
+    };
+    union {
+        __u16 dst_port_end;
+        __u16 icmp_code_end;
+    };
     __u16 match_mask;
     __u16 invert_mask;
     __u8  proto;

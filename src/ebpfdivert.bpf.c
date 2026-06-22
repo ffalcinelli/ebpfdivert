@@ -42,6 +42,8 @@ struct {
     __type(value, __u32);
 } config_map SEC(".maps");
 
+const volatile __u32 snaplen = 2048;
+
 static __always_inline void increment_stat(__u32 key) {
     __u64 *val = bpf_map_lookup_elem(&stats_map, &key);
     if (val) {
@@ -166,6 +168,12 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
                 pkt->src_port = bpf_ntohs(udp->source);
                 pkt->dst_port = bpf_ntohs(udp->dest);
             }
+        } else if (pkt->proto == 1) { // ICMP
+            struct icmphdr *icmp = transport_ptr;
+            if ((void *)(icmp + 1) <= data_end) {
+                pkt->src_port = icmp->type;
+                pkt->dst_port = icmp->code;
+            }
         }
     } else if (pkt->ver == 6) {
         struct ipv6hdr *ip6 = l3_ptr;
@@ -229,6 +237,12 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
             if ((void *)(udp + 1) <= data_end) {
                 pkt->src_port = bpf_ntohs(udp->source);
                 pkt->dst_port = bpf_ntohs(udp->dest);
+            }
+        } else if (pkt->proto == 58) { // ICMPv6
+            struct icmp6hdr *icmp6 = transport_ptr;
+            if ((void *)(icmp6 + 1) <= data_end) {
+                pkt->src_port = icmp6->icmp6_type;
+                pkt->dst_port = icmp6->icmp6_code;
             }
         }
     } else {
@@ -380,7 +394,9 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
     buf->header.pad = 0xDEADC0DE;
 
     __u32 to_load = skb->len;
-    if (to_load > 2048) to_load = 2048;
+    __u32 max_len = snaplen;
+    if (max_len > 2048) max_len = 2048;
+    if (to_load > max_len) to_load = max_len;
     if (to_load > 0) {
         bpf_skb_load_bytes(skb, 0, buf->data, ((to_load - 1) & 0x7FF) + 1);
     }

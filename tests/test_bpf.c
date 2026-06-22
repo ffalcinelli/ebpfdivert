@@ -389,6 +389,107 @@ void test_loop_prevention(int prog_fd, const char *msg) {
     }
 }
 
+void update_rule_icmp(int map_fd, __u32 key, __u8 type, __u8 code, __u16 mask) {
+    struct filter_rule rule = {0};
+    rule.proto = 1; // ICMP
+    rule.icmp_type_start = type;
+    rule.icmp_type_end = type;
+    rule.icmp_code_start = code;
+    rule.icmp_code_end = code;
+    rule.match_mask = mask | MATCH_ENABLED | MATCH_PROTO;
+    if (bpf_map_update_elem(map_fd, &key, &rule, BPF_ANY)) {
+        fprintf(stderr, "ERROR: updating filter_rules map failed: %s\n", strerror(errno));
+        exit(1);
+    }
+}
+
+void update_rule_icmp6(int map_fd, __u32 key, __u8 type, __u8 code, __u16 mask) {
+    struct filter_rule_ipv6 rule = {0};
+    rule.proto = 58; // ICMPv6
+    rule.icmp_type_start = type;
+    rule.icmp_type_end = type;
+    rule.icmp_code_start = code;
+    rule.icmp_code_end = code;
+    rule.match_mask = mask | MATCH_ENABLED | MATCH_PROTO;
+    if (bpf_map_update_elem(map_fd, &key, &rule, BPF_ANY)) {
+        fprintf(stderr, "ERROR: updating filter_rules_ipv6 map failed: %s\n", strerror(errno));
+        exit(1);
+    }
+}
+
+void test_packet_icmp(int prog_fd, const char *msg, int expected_retval, __u8 type, __u8 code) {
+    char packet[128];
+    memset(packet, 0, sizeof(packet));
+
+    struct iphdr *ip = (struct iphdr *)packet;
+    ip->version = 4;
+    ip->ihl = 5;
+    ip->protocol = 1; // ICMP
+    ip->saddr = inet_addr("127.0.0.1");
+    ip->daddr = inet_addr("127.0.0.1");
+    ip->tot_len = htons(sizeof(struct iphdr) + 8);
+
+    __u8 *icmp = (__u8 *)(packet + sizeof(struct iphdr));
+    icmp[0] = type;
+    icmp[1] = code;
+
+    struct bpf_test_run_opts opts = {
+        .sz = sizeof(struct bpf_test_run_opts),
+        .data_in = packet,
+        .data_size_in = sizeof(packet),
+        .repeat = 1,
+    };
+
+    int err = bpf_prog_test_run_opts(prog_fd, &opts);
+    if (err) {
+        printf("  [FAIL] %s: bpf_prog_test_run_opts failed: %s\n", msg, strerror(errno));
+        exit(1);
+    }
+
+    if (opts.retval == expected_retval) {
+        printf("  [PASS] %s (retval=%d)\n", msg, opts.retval);
+    } else {
+        printf("  [FAIL] %s: expected retval=%d, got %d\n", msg, expected_retval, opts.retval);
+        exit(1);
+    }
+}
+
+void test_packet_icmp6(int prog_fd, const char *msg, int expected_retval, __u8 type, __u8 code) {
+    char packet[128];
+    memset(packet, 0, sizeof(packet));
+
+    struct ipv6hdr *ip6 = (struct ipv6hdr *)packet;
+    ip6->version = 6;
+    ip6->nexthdr = 58; // ICMPv6
+    ip6->hop_limit = 64;
+    inet_pton(AF_INET6, "::1", &ip6->saddr);
+    inet_pton(AF_INET6, "2001:db8::1", &ip6->daddr);
+
+    __u8 *icmp6 = (__u8 *)(packet + sizeof(struct ipv6hdr));
+    icmp6[0] = type;
+    icmp6[1] = code;
+
+    struct bpf_test_run_opts opts = {
+        .sz = sizeof(struct bpf_test_run_opts),
+        .data_in = packet,
+        .data_size_in = sizeof(packet),
+        .repeat = 1,
+    };
+
+    int err = bpf_prog_test_run_opts(prog_fd, &opts);
+    if (err) {
+        printf("  [FAIL] %s: bpf_prog_test_run_opts failed: %s\n", msg, strerror(errno));
+        exit(1);
+    }
+
+    if (opts.retval == expected_retval) {
+        printf("  [PASS] %s (retval=%d)\n", msg, opts.retval);
+    } else {
+        printf("  [FAIL] %s: expected retval=%d, got %d\n", msg, expected_retval, opts.retval);
+        exit(1);
+    }
+}
+
 int main(int argc, char **argv) {
     libbpf_set_print(libbpf_print_fn);
     if (argc < 2) {
@@ -400,6 +501,18 @@ int main(int argc, char **argv) {
     if (!obj) {
         fprintf(stderr, "ERROR: opening BPF object file failed\n");
         return 1;
+    }
+
+    struct bpf_map *rodata = bpf_object__find_map_by_name(obj, ".rodata");
+    if (rodata) {
+        __u32 new_snaplen = 512;
+        if (bpf_map__set_initial_value(rodata, &new_snaplen, sizeof(new_snaplen))) {
+            fprintf(stderr, "WARNING: setting initial value for .rodata failed\n");
+        } else {
+            printf("  [INFO] Successfully set snaplen to %u via .rodata map\n", new_snaplen);
+        }
+    } else {
+        fprintf(stderr, "WARNING: .rodata map not found\n");
     }
 
     if (bpf_object__load(obj)) {
@@ -498,6 +611,16 @@ int main(int argc, char **argv) {
 
     // Case 15: Loop Prevention check
     test_loop_prevention(prog_fd, "Loop Prevention behavior (ignored)");
+
+    // Case 16: ICMP type/code match and divert (e.g. Type 8 Code 0 - Echo Request)
+    update_rule_icmp(map_fd, 0, 8, 0, MATCH_SRC_PORT | MATCH_DST_PORT);
+    test_packet_icmp(prog_fd, "ICMP Match and Divert (Echo Request)", 4, 8, 0);
+    test_packet_icmp(prog_fd, "ICMP Mismatch - different type (Echo Reply)", -1, 0, 0);
+
+    // Case 17: ICMPv6 type/code match and divert (e.g. Type 128 Code 0 - Echo Request)
+    update_rule_icmp6(map_fd_v6, 0, 128, 0, MATCH_SRC_PORT | MATCH_DST_PORT);
+    test_packet_icmp6(prog_fd, "ICMPv6 Match and Divert (Echo Request)", 4, 128, 0);
+    test_packet_icmp6(prog_fd, "ICMPv6 Mismatch - different type (Echo Reply)", -1, 129, 0);
 
     printf("All eBPF C Tests passed!\n");
     bpf_object__close(obj);
