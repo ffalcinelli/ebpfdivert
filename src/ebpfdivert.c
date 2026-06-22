@@ -720,7 +720,7 @@ int ebpfdivert_send(ebpfdivert_handle_t *h, const struct divert_packet_buffer *b
             .tp_frame_nr = 64
         };
         if (setsockopt(sock, SOL_PACKET, PACKET_TX_RING, &req, sizeof(req)) == 0) {
-            size_t ring_len = req.tp_block_size * req.tp_block_nr;
+            size_t ring_len = (size_t)req.tp_block_size * (size_t)req.tp_block_nr;
             tx_ring = mmap(NULL, ring_len, PROT_READ | PROT_WRITE, MAP_SHARED, sock, 0);
             if (tx_ring == MAP_FAILED) {
                 tx_ring = NULL;
