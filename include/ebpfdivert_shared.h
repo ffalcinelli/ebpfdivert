@@ -117,4 +117,10 @@ struct filter_rule_ipv6 {
     __u8  tcp_flags_mask;
 } __attribute__((packed));
 
+struct divert_config {
+    __u32 priority;
+    __u32 snaplen;
+    __u32 loop_prevention_mark;
+} __attribute__((packed));
+
 #endif // EBPFDIVERT_SHARED_H

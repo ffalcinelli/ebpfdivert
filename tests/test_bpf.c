@@ -440,8 +440,9 @@ int main(int argc, char **argv) {
     int map_fd_v6 = bpf_object__find_map_fd_by_name(obj, "filter_rules_ipv6");
     int stats_fd = bpf_object__find_map_fd_by_name(obj, "stats_map");
     int ringbuf_fd = bpf_object__find_map_fd_by_name(obj, "pcap_ringbuf");
+    int config_fd = bpf_object__find_map_fd_by_name(obj, "config_map");
     struct bpf_program *prog = bpf_object__find_program_by_name(obj, "tc_divert_egress");
-    if (map_fd < 0 || map_fd_v6 < 0 || stats_fd < 0 || ringbuf_fd < 0 || !prog) {
+    if (map_fd < 0 || map_fd_v6 < 0 || stats_fd < 0 || ringbuf_fd < 0 || config_fd < 0 || !prog) {
         fprintf(stderr, "ERROR: finding maps or program failed\n");
         return 1;
     }
@@ -450,6 +451,18 @@ int main(int argc, char **argv) {
     struct ring_buffer *rb = ring_buffer__new(ringbuf_fd, handle_ringbuf_sample, NULL, NULL);
     if (!rb) {
         fprintf(stderr, "ERROR: failed to initialize ring buffer consumer\n");
+        return 1;
+    }
+
+    // Initialize config_map
+    __u32 config_key = 0;
+    struct divert_config config = {
+        .priority = 0,
+        .snaplen = 512,
+        .loop_prevention_mark = 0x4D490000
+    };
+    if (bpf_map_update_elem(config_fd, &config_key, &config, BPF_ANY)) {
+        fprintf(stderr, "ERROR: initializing config_map failed: %s\n", strerror(errno));
         return 1;
     }
 

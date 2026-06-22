@@ -39,10 +39,10 @@ struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, __u32);
+    __type(value, struct divert_config);
 } config_map SEC(".maps");
 
-const volatile __u32 snaplen = 2048;
+const volatile __u32 default_snaplen = 2048;
 
 static __always_inline void increment_stat(__u32 key) {
     __u64 *val = bpf_map_lookup_elem(&stats_map, &key);
@@ -327,11 +327,13 @@ static __always_inline int matches_rule_ipv6(struct parsed_packet *pkt, struct f
 
 static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction) {
     __u32 key = 0;
-    __u32 *my_prio_ptr = bpf_map_lookup_elem(&config_map, &key);
-    __u32 my_prio = my_prio_ptr ? *my_prio_ptr : 0;
+    struct divert_config *cfg = bpf_map_lookup_elem(&config_map, &key);
+    __u32 my_prio = cfg ? cfg->priority : 0;
+    __u32 prevent_mark = (cfg && cfg->loop_prevention_mark) ? cfg->loop_prevention_mark : 0x4D490000;
+    __u32 snap = (cfg && cfg->snaplen) ? cfg->snaplen : default_snaplen;
 
-    // LOOP_PREVENTION_MARK mask: 0x4D490000 | priority
-    if ((skb->mark & 0xFFFF0000) == 0x4D490000) {
+    // LOOP_PREVENTION_MARK mask: prevent_mark | priority
+    if ((skb->mark & 0xFFFF0000) == (prevent_mark & 0xFFFF0000)) {
         __u16 inject_prio = skb->mark & 0xFFFF;
         // Ignore if we injected it, or if our priority is higher/equal (lower/equal integer)
         // than the injector's priority. This allows lower priority handles (higher integer)
@@ -398,7 +400,7 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
     buf->header.pad = 0xDEADC0DE;
 
     __u32 to_load = skb->len;
-    __u32 max_len = snaplen;
+    __u32 max_len = snap;
     if (max_len > 2048) max_len = 2048;
     if (to_load > max_len) to_load = max_len;
     if (to_load > 0) {
