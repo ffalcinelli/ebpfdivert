@@ -56,3 +56,4 @@ dkms.conf
 .idea/
 *.swp
 *~
+ebpfdivert-cli

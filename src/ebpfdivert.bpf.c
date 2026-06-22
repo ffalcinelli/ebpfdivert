@@ -53,9 +53,15 @@ static __always_inline void increment_stat(__u32 key) {
 
 struct parsed_packet {
     __u32 src_ip;
-    __u8  src_ip6[16] __attribute__((aligned(8)));
+    union {
+        __u8  src_ip6[16] __attribute__((aligned(8)));
+        __u64 src_ip6_u64[2];
+    };
     __u32 dst_ip;
-    __u8  dst_ip6[16] __attribute__((aligned(8)));
+    union {
+        __u8  dst_ip6[16] __attribute__((aligned(8)));
+        __u64 dst_ip6_u64[2];
+    };
     __u16 src_port;
     __u16 dst_port;
     __u16 l2_len;
@@ -71,7 +77,6 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
     void *data_end = (void *)(long)skb->data_end;
     void *data = (void *)(long)skb->data;
 
-    __u16 proto = bpf_ntohs(skb->protocol);
     __u16 l2_len = 0;
     int found = 0;
 
@@ -294,18 +299,14 @@ static __always_inline int matches_rule_ipv6(struct parsed_packet *pkt, struct f
     if (pkt->ver != 6) return 0;
 
     if (rule->match_mask & MATCH_SRC_IP) {
-        __u64 *p1 = (__u64 *)pkt->src_ip6;
-        __u64 *r1 = (__u64 *)rule->src_ip;
-        __u64 *m1 = (__u64 *)rule->src_mask;
-        int ip_match = ((p1[0] & m1[0]) == (r1[0] & m1[0])) && ((p1[1] & m1[1]) == (r1[1] & m1[1]));
+        int ip_match = ((pkt->src_ip6_u64[0] & rule->src_mask_u64[0]) == (rule->src_ip_u64[0] & rule->src_mask_u64[0])) &&
+                       ((pkt->src_ip6_u64[1] & rule->src_mask_u64[1]) == (rule->src_ip_u64[1] & rule->src_mask_u64[1]));
         if (ip_match == !!(rule->invert_mask & MATCH_SRC_IP)) return 0;
     }
 
     if (rule->match_mask & MATCH_DST_IP) {
-        __u64 *p2 = (__u64 *)pkt->dst_ip6;
-        __u64 *r2 = (__u64 *)rule->dst_ip;
-        __u64 *m2 = (__u64 *)rule->dst_mask;
-        int ip_match = ((p2[0] & m2[0]) == (r2[0] & m2[0])) && ((p2[1] & m2[1]) == (r2[1] & m2[1]));
+        int ip_match = ((pkt->dst_ip6_u64[0] & rule->dst_mask_u64[0]) == (rule->dst_ip_u64[0] & rule->dst_mask_u64[0])) &&
+                       ((pkt->dst_ip6_u64[1] & rule->dst_mask_u64[1]) == (rule->dst_ip_u64[1] & rule->dst_mask_u64[1]));
         if (ip_match == !!(rule->invert_mask & MATCH_DST_IP)) return 0;
     }
 
@@ -338,7 +339,10 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
         if (my_prio <= inject_prio) return TC_ACT_UNSPEC;
     }
 
-    bpf_skb_pull_data(skb, 64);
+    if (bpf_skb_pull_data(skb, 128) < 0) {
+        increment_stat(STAT_PARSING_ERR);
+        return TC_ACT_UNSPEC;
+    }
 
     struct parsed_packet pkt = {0};
     if (!parse_packet(skb, &pkt)) {
@@ -398,7 +402,12 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
     if (max_len > 2048) max_len = 2048;
     if (to_load > max_len) to_load = max_len;
     if (to_load > 0) {
-        bpf_skb_load_bytes(skb, 0, buf->data, ((to_load - 1) & 0x7FF) + 1);
+        int ret = bpf_skb_load_bytes(skb, 0, buf->data, ((to_load - 1) & 0x7FF) + 1);
+        if (ret < 0) {
+            bpf_ringbuf_discard(buf, 0);
+            increment_stat(STAT_PARSING_ERR);
+            return TC_ACT_UNSPEC;
+        }
     }
 
     bpf_ringbuf_submit(buf, 0);

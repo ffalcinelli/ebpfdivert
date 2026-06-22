@@ -106,7 +106,93 @@ void get_stat(int stats_fd, __u32 key, __u64 *total) {
     }
 }
 
-void test_packet(int prog_fd, const char *msg, int expected_retval, __u16 dport) {
+struct last_rb_pkt {
+    int received;
+    struct divert_packet_buffer pkt;
+    size_t size;
+};
+
+static struct last_rb_pkt g_last_rb_pkt;
+
+static int handle_ringbuf_sample(void *ctx, void *data, size_t size) {
+    if (size > sizeof(struct divert_packet_buffer)) {
+        size = sizeof(struct divert_packet_buffer);
+    }
+    memcpy(&g_last_rb_pkt.pkt, data, size);
+    g_last_rb_pkt.size = size;
+    g_last_rb_pkt.received = 1;
+    return 0;
+}
+
+void run_bpf_test_packet(int prog_fd, struct ring_buffer *rb, const char *msg,
+                         const void *pkt_data, size_t pkt_len,
+                         const struct __sk_buff *ctx_in,
+                         int expected_retval,
+                         int expect_rb_capture,
+                         __u16 expected_direction,
+                         __u16 expected_l2_len) {
+    g_last_rb_pkt.received = 0;
+
+    struct bpf_test_run_opts opts = {
+        .sz = sizeof(struct bpf_test_run_opts),
+        .data_in = pkt_data,
+        .data_size_in = pkt_len,
+        .repeat = 1,
+    };
+    if (ctx_in) {
+        opts.ctx_in = ctx_in;
+        opts.ctx_size_in = sizeof(struct __sk_buff);
+    }
+
+    int err = bpf_prog_test_run_opts(prog_fd, &opts);
+    if (err) {
+        printf("  [FAIL] %s: bpf_prog_test_run_opts failed: %s\n", msg, strerror(errno));
+        exit(1);
+    }
+
+    if (opts.retval != expected_retval) {
+        printf("  [FAIL] %s: expected retval=%d, got %d\n", msg, expected_retval, opts.retval);
+        exit(1);
+    }
+
+    // Read from ring buffer if it exists
+    if (rb) {
+        ring_buffer__poll(rb, expect_rb_capture ? 50 : 10);
+        
+        if (expect_rb_capture) {
+            if (!g_last_rb_pkt.received) {
+                printf("  [FAIL] %s: expected packet in ring buffer, but none received\n", msg);
+                exit(1);
+            }
+            // Validate headers
+            if (g_last_rb_pkt.pkt.header.pkt_len != pkt_len) {
+                printf("  [FAIL] %s: ringbuf pkt_len mismatch (expected %zu, got %u)\n", msg, pkt_len, g_last_rb_pkt.pkt.header.pkt_len);
+                exit(1);
+            }
+            if (g_last_rb_pkt.pkt.header.direction != expected_direction) {
+                printf("  [FAIL] %s: ringbuf direction mismatch (expected %u, got %u)\n", msg, expected_direction, g_last_rb_pkt.pkt.header.direction);
+                exit(1);
+            }
+            if (g_last_rb_pkt.pkt.header.l2_len != expected_l2_len) {
+                printf("  [FAIL] %s: ringbuf l2_len mismatch (expected %u, got %u)\n", msg, expected_l2_len, g_last_rb_pkt.pkt.header.l2_len);
+                exit(1);
+            }
+            if (g_last_rb_pkt.pkt.header.pad != 0xDEADC0DE) {
+                printf("  [FAIL] %s: ringbuf header pad mismatch (expected 0xDEADC0DE, got 0x%X)\n", msg, g_last_rb_pkt.pkt.header.pad);
+                exit(1);
+            }
+        } else {
+            if (g_last_rb_pkt.received) {
+                printf("  [FAIL] %s: did not expect packet in ring buffer, but one was received\n", msg);
+                exit(1);
+            }
+        }
+    }
+
+    printf("  [PASS] %s (retval=%d%s)\n", msg, opts.retval, expect_rb_capture ? ", captured in ringbuf" : "");
+}
+
+void test_packet(int prog_fd, struct ring_buffer *rb, const char *msg, int expected_retval, __u16 dport, int expect_rb_capture) {
     char packet[128];
     memset(packet, 0, sizeof(packet));
 
@@ -122,28 +208,11 @@ void test_packet(int prog_fd, const char *msg, int expected_retval, __u16 dport)
     tcp->source = htons(12345);
     tcp->dest = htons(dport);
 
-    struct bpf_test_run_opts opts = {
-        .sz = sizeof(struct bpf_test_run_opts),
-        .data_in = packet,
-        .data_size_in = sizeof(packet),
-        .repeat = 1,
-    };
-
-    int err = bpf_prog_test_run_opts(prog_fd, &opts);
-    if (err) {
-        printf("  [FAIL] %s: bpf_prog_test_run_opts failed: %s\n", msg, strerror(errno));
-        exit(1);
-    }
-
-    if (opts.retval == expected_retval) {
-        printf("  [PASS] %s (retval=%d)\n", msg, opts.retval);
-    } else {
-        printf("  [FAIL] %s: expected retval=%d, got %d\n", msg, expected_retval, opts.retval);
-        exit(1);
-    }
+    run_bpf_test_packet(prog_fd, rb, msg, packet, sizeof(packet), NULL, expected_retval, expect_rb_capture, 2, 0);
 }
 
-void test_packet_advanced(int prog_fd, const char *msg, int expected_retval, const char *sip_str, const char *dip_str, __u16 sport, __u16 dport) {
+void test_packet_advanced(int prog_fd, struct ring_buffer *rb, const char *msg, int expected_retval,
+                           const char *sip_str, const char *dip_str, __u16 sport, __u16 dport, int expect_rb_capture) {
     char packet[128];
     memset(packet, 0, sizeof(packet));
 
@@ -159,28 +228,10 @@ void test_packet_advanced(int prog_fd, const char *msg, int expected_retval, con
     tcp->source = htons(sport);
     tcp->dest = htons(dport);
 
-    struct bpf_test_run_opts opts = {
-        .sz = sizeof(struct bpf_test_run_opts),
-        .data_in = packet,
-        .data_size_in = sizeof(packet),
-        .repeat = 1,
-    };
-
-    int err = bpf_prog_test_run_opts(prog_fd, &opts);
-    if (err) {
-        printf("  [FAIL] %s: bpf_prog_test_run_opts failed: %s\n", msg, strerror(errno));
-        exit(1);
-    }
-
-    if (opts.retval == expected_retval) {
-        printf("  [PASS] %s (retval=%d)\n", msg, opts.retval);
-    } else {
-        printf("  [FAIL] %s: expected retval=%d, got %d\n", msg, expected_retval, opts.retval);
-        exit(1);
-    }
+    run_bpf_test_packet(prog_fd, rb, msg, packet, sizeof(packet), NULL, expected_retval, expect_rb_capture, 2, 0);
 }
 
-void test_packet_ipv6(int prog_fd, const char *msg, int expected_retval, const char *dip_str, __u16 dport) {
+void test_packet_ipv6(int prog_fd, struct ring_buffer *rb, const char *msg, int expected_retval, const char *dip_str, __u16 dport, int expect_rb_capture) {
     char packet[128];
     memset(packet, 0, sizeof(packet));
 
@@ -195,28 +246,11 @@ void test_packet_ipv6(int prog_fd, const char *msg, int expected_retval, const c
     tcp->source = htons(12345);
     tcp->dest = htons(dport);
 
-    struct bpf_test_run_opts opts = {
-        .sz = sizeof(struct bpf_test_run_opts),
-        .data_in = packet,
-        .data_size_in = sizeof(packet),
-        .repeat = 1,
-    };
-
-    int err = bpf_prog_test_run_opts(prog_fd, &opts);
-    if (err) {
-        printf("  [FAIL] %s: bpf_prog_test_run_opts failed: %s\n", msg, strerror(errno));
-        exit(1);
-    }
-
-    if (opts.retval == expected_retval) {
-        printf("  [PASS] %s (retval=%d)\n", msg, opts.retval);
-    } else {
-        printf("  [FAIL] %s: expected retval=%d, got %d\n", msg, expected_retval, opts.retval);
-        exit(1);
-    }
+    run_bpf_test_packet(prog_fd, rb, msg, packet, sizeof(packet), NULL, expected_retval, expect_rb_capture, 2, 0);
 }
 
-void test_packet_ipv6_advanced(int prog_fd, const char *msg, int expected_retval, const char *sip_str, const char *dip_str, __u16 sport, __u16 dport) {
+void test_packet_ipv6_advanced(int prog_fd, struct ring_buffer *rb, const char *msg, int expected_retval,
+                               const char *sip_str, const char *dip_str, __u16 sport, __u16 dport, int expect_rb_capture) {
     char packet[128];
     memset(packet, 0, sizeof(packet));
 
@@ -231,28 +265,10 @@ void test_packet_ipv6_advanced(int prog_fd, const char *msg, int expected_retval
     tcp->source = htons(sport);
     tcp->dest = htons(dport);
 
-    struct bpf_test_run_opts opts = {
-        .sz = sizeof(struct bpf_test_run_opts),
-        .data_in = packet,
-        .data_size_in = sizeof(packet),
-        .repeat = 1,
-    };
-
-    int err = bpf_prog_test_run_opts(prog_fd, &opts);
-    if (err) {
-        printf("  [FAIL] %s: bpf_prog_test_run_opts failed: %s\n", msg, strerror(errno));
-        exit(1);
-    }
-
-    if (opts.retval == expected_retval) {
-        printf("  [PASS] %s (retval=%d)\n", msg, opts.retval);
-    } else {
-        printf("  [FAIL] %s: expected retval=%d, got %d\n", msg, expected_retval, opts.retval);
-        exit(1);
-    }
+    run_bpf_test_packet(prog_fd, rb, msg, packet, sizeof(packet), NULL, expected_retval, expect_rb_capture, 2, 0);
 }
 
-void test_packet_ipv6_ext(int prog_fd, const char *msg, int expected_retval, const char *dip_str, __u16 dport) {
+void test_packet_ipv6_ext(int prog_fd, struct ring_buffer *rb, const char *msg, int expected_retval, const char *dip_str, __u16 dport, int expect_rb_capture) {
     char packet[128];
     memset(packet, 0, sizeof(packet));
 
@@ -272,44 +288,19 @@ void test_packet_ipv6_ext(int prog_fd, const char *msg, int expected_retval, con
     tcp->source = htons(12345);
     tcp->dest = htons(dport);
 
-    struct bpf_test_run_opts opts = {
-        .sz = sizeof(struct bpf_test_run_opts),
-        .data_in = packet,
-        .data_size_in = sizeof(packet),
-        .repeat = 1,
-    };
-
-    int err = bpf_prog_test_run_opts(prog_fd, &opts);
-    if (err) {
-        printf("  [FAIL] %s: bpf_prog_test_run_opts failed: %s\n", msg, strerror(errno));
-        exit(1);
-    }
-
-    if (opts.retval == expected_retval) {
-        printf("  [PASS] %s (retval=%d)\n", msg, opts.retval);
-    } else {
-        printf("  [FAIL] %s: expected retval=%d, got %d\n", msg, expected_retval, opts.retval);
-        exit(1);
-    }
+    run_bpf_test_packet(prog_fd, rb, msg, packet, sizeof(packet), NULL, expected_retval, expect_rb_capture, 2, 0);
 }
 
-void test_packet_qinq(int prog_fd, const char *msg, int expected_retval, __u16 dport) {
+void test_packet_qinq(int prog_fd, struct ring_buffer *rb, const char *msg, int expected_retval, __u16 dport, int expect_rb_capture) {
     char packet[128];
     memset(packet, 0, sizeof(packet));
 
-    // Outer Ethernet header + outer VLAN tag (18 bytes)
-    // 0-5: Dst MAC (dummy)
-    // 6-11: Src MAC (dummy)
-    // 12-13: Outer TPID (0x88A8)
+    // Outer Ethernet header + outer VLAN tag (18 bytes) + inner VLAN tag (4 bytes) = 22 bytes total L2
     __u16 *p16 = (__u16 *)packet;
     p16[6] = htons(0x88A8);
-    // 14-15: Outer TCI (dummy)
     p16[7] = htons(10);
-    // 16-17: Inner TPID (0x8100)
     p16[8] = htons(0x8100);
-    // 18-19: Inner TCI (dummy)
     p16[9] = htons(20);
-    // 20-21: Ethertype (0x0800)
     p16[10] = htons(0x0800);
 
     // IPv4 header starts at offset 22
@@ -325,28 +316,10 @@ void test_packet_qinq(int prog_fd, const char *msg, int expected_retval, __u16 d
     tcp->source = htons(12345);
     tcp->dest = htons(dport);
 
-    struct bpf_test_run_opts opts = {
-        .sz = sizeof(struct bpf_test_run_opts),
-        .data_in = packet,
-        .data_size_in = sizeof(packet),
-        .repeat = 1,
-    };
-
-    int err = bpf_prog_test_run_opts(prog_fd, &opts);
-    if (err) {
-        printf("  [FAIL] %s: bpf_prog_test_run_opts failed: %s\n", msg, strerror(errno));
-        exit(1);
-    }
-
-    if (opts.retval == expected_retval) {
-        printf("  [PASS] %s (retval=%d)\n", msg, opts.retval);
-    } else {
-        printf("  [FAIL] %s: expected retval=%d, got %d\n", msg, expected_retval, opts.retval);
-        exit(1);
-    }
+    run_bpf_test_packet(prog_fd, rb, msg, packet, sizeof(packet), NULL, expected_retval, expect_rb_capture, 2, 22);
 }
 
-void test_loop_prevention(int prog_fd, const char *msg) {
+void test_loop_prevention(int prog_fd, struct ring_buffer *rb, const char *msg) {
     char packet[128];
     memset(packet, 0, sizeof(packet));
 
@@ -365,28 +338,7 @@ void test_loop_prevention(int prog_fd, const char *msg) {
     struct __sk_buff ctx = {0};
     ctx.mark = 0x4D490000 | 10; // injected priority = 10
 
-    struct bpf_test_run_opts opts = {
-        .sz = sizeof(struct bpf_test_run_opts),
-        .data_in = packet,
-        .data_size_in = sizeof(packet),
-        .ctx_in = &ctx,
-        .ctx_size_in = sizeof(ctx),
-        .repeat = 1,
-    };
-
-    int err = bpf_prog_test_run_opts(prog_fd, &opts);
-    if (err) {
-        printf("  [FAIL] %s: bpf_prog_test_run_opts failed: %s\n", msg, strerror(errno));
-        exit(1);
-    }
-
-    // my_prio defaults to 0, since 0 <= 10, it should return TC_ACT_UNSPEC (-1)
-    if (opts.retval == -1) {
-        printf("  [PASS] %s (retval=%d)\n", msg, opts.retval);
-    } else {
-        printf("  [FAIL] %s: expected retval=-1, got %d\n", msg, opts.retval);
-        exit(1);
-    }
+    run_bpf_test_packet(prog_fd, rb, msg, packet, sizeof(packet), &ctx, -1, 0, 2, 0);
 }
 
 void update_rule_icmp(int map_fd, __u32 key, __u8 type, __u8 code, __u16 mask) {
@@ -417,7 +369,7 @@ void update_rule_icmp6(int map_fd, __u32 key, __u8 type, __u8 code, __u16 mask) 
     }
 }
 
-void test_packet_icmp(int prog_fd, const char *msg, int expected_retval, __u8 type, __u8 code) {
+void test_packet_icmp(int prog_fd, struct ring_buffer *rb, const char *msg, int expected_retval, __u8 type, __u8 code, int expect_rb_capture) {
     char packet[128];
     memset(packet, 0, sizeof(packet));
 
@@ -433,28 +385,10 @@ void test_packet_icmp(int prog_fd, const char *msg, int expected_retval, __u8 ty
     icmp[0] = type;
     icmp[1] = code;
 
-    struct bpf_test_run_opts opts = {
-        .sz = sizeof(struct bpf_test_run_opts),
-        .data_in = packet,
-        .data_size_in = sizeof(packet),
-        .repeat = 1,
-    };
-
-    int err = bpf_prog_test_run_opts(prog_fd, &opts);
-    if (err) {
-        printf("  [FAIL] %s: bpf_prog_test_run_opts failed: %s\n", msg, strerror(errno));
-        exit(1);
-    }
-
-    if (opts.retval == expected_retval) {
-        printf("  [PASS] %s (retval=%d)\n", msg, opts.retval);
-    } else {
-        printf("  [FAIL] %s: expected retval=%d, got %d\n", msg, expected_retval, opts.retval);
-        exit(1);
-    }
+    run_bpf_test_packet(prog_fd, rb, msg, packet, sizeof(packet), NULL, expected_retval, expect_rb_capture, 2, 0);
 }
 
-void test_packet_icmp6(int prog_fd, const char *msg, int expected_retval, __u8 type, __u8 code) {
+void test_packet_icmp6(int prog_fd, struct ring_buffer *rb, const char *msg, int expected_retval, __u8 type, __u8 code, int expect_rb_capture) {
     char packet[128];
     memset(packet, 0, sizeof(packet));
 
@@ -469,25 +403,7 @@ void test_packet_icmp6(int prog_fd, const char *msg, int expected_retval, __u8 t
     icmp6[0] = type;
     icmp6[1] = code;
 
-    struct bpf_test_run_opts opts = {
-        .sz = sizeof(struct bpf_test_run_opts),
-        .data_in = packet,
-        .data_size_in = sizeof(packet),
-        .repeat = 1,
-    };
-
-    int err = bpf_prog_test_run_opts(prog_fd, &opts);
-    if (err) {
-        printf("  [FAIL] %s: bpf_prog_test_run_opts failed: %s\n", msg, strerror(errno));
-        exit(1);
-    }
-
-    if (opts.retval == expected_retval) {
-        printf("  [PASS] %s (retval=%d)\n", msg, opts.retval);
-    } else {
-        printf("  [FAIL] %s: expected retval=%d, got %d\n", msg, expected_retval, opts.retval);
-        exit(1);
-    }
+    run_bpf_test_packet(prog_fd, rb, msg, packet, sizeof(packet), NULL, expected_retval, expect_rb_capture, 2, 0);
 }
 
 int main(int argc, char **argv) {
@@ -523,12 +439,19 @@ int main(int argc, char **argv) {
     int map_fd = bpf_object__find_map_fd_by_name(obj, "filter_rules");
     int map_fd_v6 = bpf_object__find_map_fd_by_name(obj, "filter_rules_ipv6");
     int stats_fd = bpf_object__find_map_fd_by_name(obj, "stats_map");
+    int ringbuf_fd = bpf_object__find_map_fd_by_name(obj, "pcap_ringbuf");
     struct bpf_program *prog = bpf_object__find_program_by_name(obj, "tc_divert_egress");
-    if (map_fd < 0 || map_fd_v6 < 0 || stats_fd < 0 || !prog) {
+    if (map_fd < 0 || map_fd_v6 < 0 || stats_fd < 0 || ringbuf_fd < 0 || !prog) {
         fprintf(stderr, "ERROR: finding maps or program failed\n");
         return 1;
     }
     int prog_fd = bpf_program__fd(prog);
+
+    struct ring_buffer *rb = ring_buffer__new(ringbuf_fd, handle_ringbuf_sample, NULL, NULL);
+    if (!rb) {
+        fprintf(stderr, "ERROR: failed to initialize ring buffer consumer\n");
+        return 1;
+    }
 
     printf("Running eBPF C Tests...\n");
 
@@ -537,7 +460,7 @@ int main(int argc, char **argv) {
     get_stat(stats_fd, STAT_DIVERTED, &stats_before);
 
     update_rule(map_fd, 0, 80, MATCH_DST_PORT, 0);
-    test_packet(prog_fd, "Match and Divert", 4, 80);
+    test_packet(prog_fd, rb, "Match and Divert", 4, 80, 1);
 
     get_stat(stats_fd, STAT_DIVERTED, &stats_after);
     if (stats_after == stats_before + 1) {
@@ -549,35 +472,35 @@ int main(int argc, char **argv) {
 
     // Case 2: Match and Sniff
     update_rule(map_fd, 0, 80, MATCH_DST_PORT | MATCH_SNIFF, 0);
-    test_packet(prog_fd, "Match and Sniff", -1, 80);
+    test_packet(prog_fd, rb, "Match and Sniff", -1, 80, 1);
 
     // Case 3: Match and Drop
     update_rule(map_fd, 0, 80, MATCH_DST_PORT | MATCH_DROP, 0);
-    test_packet(prog_fd, "Match and Drop", 2, 80);
+    test_packet(prog_fd, rb, "Match and Drop", 2, 80, 0);
 
     // Case 4: No Match
     update_rule(map_fd, 0, 80, MATCH_DST_PORT, 0);
-    test_packet(prog_fd, "No Match (different port)", -1, 8080);
+    test_packet(prog_fd, rb, "No Match (different port)", -1, 8080, 0);
 
     // Case 5: Match Inversion (Match all NOT port 80)
     update_rule(map_fd, 0, 80, MATCH_DST_PORT, MATCH_DST_PORT);
-    test_packet(prog_fd, "Match Inversion - Divert non-80 (port 8080)", 4, 8080);
-    test_packet(prog_fd, "Match Inversion - Skip 80 (port 80)", -1, 80);
+    test_packet(prog_fd, rb, "Match Inversion - Divert non-80 (port 8080)", 4, 8080, 1);
+    test_packet(prog_fd, rb, "Match Inversion - Skip 80 (port 80)", -1, 80, 0);
 
     // Case 6: IPv6 Match and Divert
     update_rule_ipv6(map_fd_v6, 0, "2001:db8::1", 80, MATCH_DST_IP | MATCH_DST_PORT, 0);
-    test_packet_ipv6(prog_fd, "IPv6 Match and Divert", 4, "2001:db8::1", 80);
+    test_packet_ipv6(prog_fd, rb, "IPv6 Match and Divert", 4, "2001:db8::1", 80, 1);
 
     // Case 7: IPv6 Match but different IP (No Match)
-    test_packet_ipv6(prog_fd, "IPv6 No Match (different IP)", -1, "2001:db8::2", 80);
+    test_packet_ipv6(prog_fd, rb, "IPv6 No Match (different IP)", -1, "2001:db8::2", 80, 0);
 
     // Case 8: IPv6 Match with Hop-by-Hop Extension Header
     update_rule_ipv6(map_fd_v6, 0, "2001:db8::1", 80, MATCH_DST_IP | MATCH_DST_PORT, 0);
-    test_packet_ipv6_ext(prog_fd, "IPv6 Match with Hop-by-Hop Ext Header", 4, "2001:db8::1", 80);
+    test_packet_ipv6_ext(prog_fd, rb, "IPv6 Match with Hop-by-Hop Ext Header", 4, "2001:db8::1", 80, 1);
 
     // Case 9: QinQ packet parsing and diversion
     update_rule(map_fd, 0, 80, MATCH_DST_PORT, 0);
-    test_packet_qinq(prog_fd, "QinQ Match and Divert", 4, 80);
+    test_packet_qinq(prog_fd, rb, "QinQ Match and Divert", 4, 80, 1);
 
     // Case 10: IPv4 Subnet/CIDR match (e.g. 192.168.1.0/24 subnet match)
     update_rule_advanced(map_fd, 0,
@@ -585,44 +508,45 @@ int main(int argc, char **argv) {
                          ntohl(inet_addr("192.168.1.0")), ntohl(inet_addr("255.255.255.0")), // dst subnet
                          0, 0, 80, 80, // dst port 80
                          MATCH_DST_IP | MATCH_DST_PORT, 0);
-    test_packet_advanced(prog_fd, "IPv4 Subnet Match (inside /24)", 4, "10.0.0.1", "192.168.1.42", 12345, 80);
+    test_packet_advanced(prog_fd, rb, "IPv4 Subnet Match (inside /24)", 4, "10.0.0.1", "192.168.1.42", 12345, 80, 1);
 
     // Case 11: IPv4 Subnet/CIDR mismatch (outside subnet)
-    test_packet_advanced(prog_fd, "IPv4 Subnet Mismatch (outside /24)", -1, "10.0.0.1", "192.168.2.42", 12345, 80);
+    test_packet_advanced(prog_fd, rb, "IPv4 Subnet Mismatch (outside /24)", -1, "10.0.0.1", "192.168.2.42", 12345, 80, 0);
 
     // Case 12: IPv6 Subnet/CIDR match (e.g. 2001:db8:abcd::/48 subnet match)
     update_rule_ipv6_advanced(map_fd_v6, 0,
-                              NULL, NULL, // src
-                              "2001:db8:abcd::", "ffff:ffff:ffff::", // dst subnet
-                              0, 0, 80, 80, // dst port 80
-                              MATCH_DST_IP | MATCH_DST_PORT, 0);
-    test_packet_ipv6_advanced(prog_fd, "IPv6 Subnet Match (inside /48)", 4, "::1", "2001:db8:abcd:12:34::56", 12345, 80);
+                               NULL, NULL, // src
+                               "2001:db8:abcd::", "ffff:ffff:ffff::", // dst subnet
+                               0, 0, 80, 80, // dst port 80
+                               MATCH_DST_IP | MATCH_DST_PORT, 0);
+    test_packet_ipv6_advanced(prog_fd, rb, "IPv6 Subnet Match (inside /48)", 4, "::1", "2001:db8:abcd:12:34::56", 12345, 80, 1);
 
     // Case 13: IPv6 Subnet/CIDR mismatch (outside subnet)
-    test_packet_ipv6_advanced(prog_fd, "IPv6 Subnet Mismatch (outside /48)", -1, "::1", "2001:db8:affe:12:34::56", 12345, 80);
+    test_packet_ipv6_advanced(prog_fd, rb, "IPv6 Subnet Mismatch (outside /48)", -1, "::1", "2001:db8:affe:12:34::56", 12345, 80, 0);
 
     // Case 14: Port range match (e.g. port 8000-8010)
     update_rule_advanced(map_fd, 0,
                          0, 0, 0, 0, // IPs
                          0, 0, 8000, 8010, // dst port range 8000-8010
                          MATCH_DST_PORT, 0);
-    test_packet(prog_fd, "Port Range Match (port 8005)", 4, 8005);
-    test_packet(prog_fd, "Port Range Mismatch (port 8015)", -1, 8015);
+    test_packet(prog_fd, rb, "Port Range Match (port 8005)", 4, 8005, 1);
+    test_packet(prog_fd, rb, "Port Range Mismatch (port 8015)", -1, 8015, 0);
 
     // Case 15: Loop Prevention check
-    test_loop_prevention(prog_fd, "Loop Prevention behavior (ignored)");
+    test_loop_prevention(prog_fd, rb, "Loop Prevention behavior (ignored)");
 
     // Case 16: ICMP type/code match and divert (e.g. Type 8 Code 0 - Echo Request)
     update_rule_icmp(map_fd, 0, 8, 0, MATCH_SRC_PORT | MATCH_DST_PORT);
-    test_packet_icmp(prog_fd, "ICMP Match and Divert (Echo Request)", 4, 8, 0);
-    test_packet_icmp(prog_fd, "ICMP Mismatch - different type (Echo Reply)", -1, 0, 0);
+    test_packet_icmp(prog_fd, rb, "ICMP Match and Divert (Echo Request)", 4, 8, 0, 1);
+    test_packet_icmp(prog_fd, rb, "ICMP Mismatch - different type (Echo Reply)", -1, 0, 0, 0);
 
     // Case 17: ICMPv6 type/code match and divert (e.g. Type 128 Code 0 - Echo Request)
     update_rule_icmp6(map_fd_v6, 0, 128, 0, MATCH_SRC_PORT | MATCH_DST_PORT);
-    test_packet_icmp6(prog_fd, "ICMPv6 Match and Divert (Echo Request)", 4, 128, 0);
-    test_packet_icmp6(prog_fd, "ICMPv6 Mismatch - different type (Echo Reply)", -1, 129, 0);
+    test_packet_icmp6(prog_fd, rb, "ICMPv6 Match and Divert (Echo Request)", 4, 128, 0, 1);
+    test_packet_icmp6(prog_fd, rb, "ICMPv6 Mismatch - different type (Echo Reply)", -1, 129, 0, 0);
 
     printf("All eBPF C Tests passed!\n");
+    ring_buffer__free(rb);
     bpf_object__close(obj);
     return 0;
 }

@@ -13,6 +13,16 @@
 #include <linux/pkt_cls.h>
 #include "ebpfdivert.h"
 
+static void cleanup_pinned_resources(void) {
+    const char *map_names[] = {"filter_rules", "filter_rules_ipv6", "stats_map", "config_map", "pcap_ringbuf"};
+    for (int i = 0; i < 5; i++) {
+        char pin_path[256];
+        snprintf(pin_path, sizeof(pin_path), "/sys/fs/bpf/ebpfdivert/%s", map_names[i]);
+        unlink(pin_path);
+    }
+    rmdir("/sys/fs/bpf/ebpfdivert");
+}
+
 int ebpfdivert_load(const char *ifname, const char *obj_path) {
     int ifindex = if_nametoindex(ifname);
     if (ifindex == 0) {
@@ -71,6 +81,8 @@ int ebpfdivert_load(const char *ifname, const char *obj_path) {
     int err = bpf_tc_attach(&hook_ingress, &opts_ingress);
     if (err) {
         fprintf(stderr, "ERROR: attaching ingress program failed: %s\n", strerror(-err));
+        bpf_tc_hook_destroy(&hook_ingress);
+        cleanup_pinned_resources();
         bpf_object__close(obj);
         return -1;
     }
@@ -90,6 +102,8 @@ int ebpfdivert_load(const char *ifname, const char *obj_path) {
     if (err) {
         fprintf(stderr, "ERROR: attaching egress program failed: %s\n", strerror(-err));
         bpf_tc_detach(&hook_ingress, &opts_ingress);
+        bpf_tc_hook_destroy(&hook_ingress);
+        cleanup_pinned_resources();
         bpf_object__close(obj);
         return -1;
     }
@@ -117,13 +131,7 @@ int ebpfdivert_unload(const char *ifname) {
         fprintf(stderr, "WARNING: destroying hook failed: %s\n", strerror(-err));
     }
 
-    const char *map_names[] = {"filter_rules", "filter_rules_ipv6", "stats_map", "config_map", "pcap_ringbuf"};
-    for (int i = 0; i < 5; i++) {
-        char pin_path[256];
-        snprintf(pin_path, sizeof(pin_path), "/sys/fs/bpf/ebpfdivert/%s", map_names[i]);
-        unlink(pin_path);
-    }
-    rmdir("/sys/fs/bpf/ebpfdivert");
+    cleanup_pinned_resources();
 
     printf("Successfully unloaded and detached eBPFDivert from '%s'\n", ifname);
     return 0;
@@ -253,6 +261,11 @@ int ebpfdivert_rules_list(void) {
 }
 
 int ebpfdivert_rules_add(int idx, const char *proto, const char *ip_cidr, const char *port_range, const char *action) {
+    if (!proto || !ip_cidr || !port_range || !action) {
+        fprintf(stderr, "ERROR: invalid NULL argument to ebpfdivert_rules_add\n");
+        return -1;
+    }
+
     int map_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/filter_rules");
     int map_fd_v6 = bpf_obj_get("/sys/fs/bpf/ebpfdivert/filter_rules_ipv6");
     if (map_fd < 0 || map_fd_v6 < 0) {

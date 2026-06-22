@@ -75,10 +75,22 @@ struct filter_rule {
 } __attribute__((packed));
 
 struct filter_rule_ipv6 {
-    __u8  src_ip[16];
-    __u8  dst_ip[16];
-    __u8  src_mask[16];
-    __u8  dst_mask[16];
+    union {
+        __u8  src_ip[16];
+        __u64 src_ip_u64[2];
+    };
+    union {
+        __u8  dst_ip[16];
+        __u64 dst_ip_u64[2];
+    };
+    union {
+        __u8  src_mask[16];
+        __u64 src_mask_u64[2];
+    };
+    union {
+        __u8  dst_mask[16];
+        __u64 dst_mask_u64[2];
+    };
     union {
         __u16 src_port_start;
         __u16 icmp_type_start;
