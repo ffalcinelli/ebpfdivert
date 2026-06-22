@@ -2,74 +2,12 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+#include "ebpfdivert_shared.h"
 
 #define TC_ACT_UNSPEC  (-1)
 #define TC_ACT_OK      0
 #define TC_ACT_SHOT    2
 #define TC_ACT_STOLEN  4
-
-#define STAT_DIVERTED 0
-#define STAT_DROPPED  1
-#define STAT_SNIFFED  2
-
-struct divert_pkt_header {
-    __u32 pkt_len;
-    __u32 ifindex;
-    __u16 direction;
-    __u16 l2_len;
-    __u32 pad;
-};
-
-struct divert_packet_buffer {
-    struct divert_pkt_header header;
-    __u8 data[2048];
-};
-
-#define MAX_RULES 64
-
-struct filter_rule {
-    __u32 src_ip;
-    __u32 dst_ip;
-    __u16 src_port;
-    __u16 dst_port;
-    __u16 match_mask;
-    __u16 invert_mask;
-    __u8  proto;
-    __u8  direction;
-    __u8  loopback;
-    __u8  ttl;
-    __u8  tcp_flags;
-    __u8  tcp_flags_mask;
-};
-
-struct filter_rule_ipv6 {
-    __u8  src_ip[16] __attribute__((aligned(8)));
-    __u8  dst_ip[16] __attribute__((aligned(8)));
-    __u16 src_port;
-    __u16 dst_port;
-    __u16 match_mask;
-    __u16 invert_mask;
-    __u8  proto;
-    __u8  direction;
-    __u8  loopback;
-    __u8  ttl;
-    __u8  tcp_flags;
-    __u8  tcp_flags_mask;
-} __attribute__((aligned(8)));
-
-#define MATCH_SRC_IP         (1 << 0)
-#define MATCH_DST_IP         (1 << 1)
-#define MATCH_SRC_PORT       (1 << 2)
-#define MATCH_DST_PORT       (1 << 3)
-#define MATCH_PROTO          (1 << 4)
-#define MATCH_DIRECTION      (1 << 5)
-#define MATCH_LOOPBACK       (1 << 6)
-#define MATCH_FALSE          (1 << 7)
-#define MATCH_ENABLED        (1 << 8)
-#define MATCH_SNIFF          (1 << 9)
-#define MATCH_DROP           (1 << 10)
-#define MATCH_TTL            (1 << 11)
-#define MATCH_TCP_FLAGS      (1 << 12)
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -92,7 +30,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 3);
+    __uint(max_entries, 5);
     __type(key, __u32);
     __type(value, __u64);
 } stats_map SEC(".maps");
@@ -149,6 +87,15 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
                 if (inner_ethertype == 0x0800 || inner_ethertype == 0x86DD) {
                     l2_len = 18;
                     found = 1;
+                } else if (inner_ethertype == 0x8100) {
+                    // QinQ: check for another VLAN tag (4 more bytes)
+                    if (data + 22 <= data_end) {
+                        __u16 inner_inner_ethertype = bpf_ntohs(*(__u16 *)((char *)data + 20));
+                        if (inner_inner_ethertype == 0x0800 || inner_inner_ethertype == 0x86DD) {
+                            l2_len = 22;
+                            found = 1;
+                        }
+                    }
                 }
             }
         }
@@ -226,13 +173,49 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
             pkt->parsed_ok = 0;
             return 0;
         }
-        pkt->proto = ip6->nexthdr;
         pkt->ttl = ip6->hop_limit;
 
         __builtin_memcpy(pkt->src_ip6, ip6->saddr.in6_u.u6_addr8, 16);
         __builtin_memcpy(pkt->dst_ip6, ip6->daddr.in6_u.u6_addr8, 16);
 
+        #define IPPROTO_HOPOPTS  0
+        #define IPPROTO_ROUTING  43
+        #define IPPROTO_FRAGMENT 44
+        #define IPPROTO_DSTOPTS  60
+
+        __u8 nexthdr = ip6->nexthdr;
         void *transport_ptr = (void *)(ip6 + 1);
+
+        #define MAX_EXT_HEADERS 4
+        #pragma unroll
+        for (int i = 0; i < MAX_EXT_HEADERS; i++) {
+            if (nexthdr != IPPROTO_HOPOPTS && nexthdr != IPPROTO_ROUTING &&
+                nexthdr != IPPROTO_FRAGMENT && nexthdr != IPPROTO_DSTOPTS) {
+                break;
+            }
+
+            if (transport_ptr + 8 > data_end) {
+                pkt->parsed_ok = 0;
+                return 0;
+            }
+
+            __u32 hdr_len = 0;
+            if (nexthdr == IPPROTO_FRAGMENT) {
+                hdr_len = 8;
+            } else {
+                hdr_len = ((*((__u8 *)transport_ptr + 1)) + 1) << 3;
+            }
+            hdr_len &= 0x7FF;
+
+            if (transport_ptr + hdr_len > data_end) {
+                pkt->parsed_ok = 0;
+                return 0;
+            }
+
+            nexthdr = *((__u8 *)transport_ptr);
+            transport_ptr += hdr_len;
+        }
+        pkt->proto = nexthdr;
 
         if (pkt->proto == 6) { // TCP
             struct tcphdr *tcp = transport_ptr;
@@ -268,10 +251,10 @@ static __always_inline int matches_rule_ipv4(struct parsed_packet *pkt, struct f
 
     if (pkt->ver != 4) return 0;
 
-    if ((rule->match_mask & MATCH_SRC_IP) && ((pkt->src_ip == rule->src_ip) == !!(rule->invert_mask & MATCH_SRC_IP))) return 0;
-    if ((rule->match_mask & MATCH_DST_IP) && ((pkt->dst_ip == rule->dst_ip) == !!(rule->invert_mask & MATCH_DST_IP))) return 0;
-    if ((rule->match_mask & MATCH_SRC_PORT) && ((pkt->src_port == rule->src_port) == !!(rule->invert_mask & MATCH_SRC_PORT))) return 0;
-    if ((rule->match_mask & MATCH_DST_PORT) && ((pkt->dst_port == rule->dst_port) == !!(rule->invert_mask & MATCH_DST_PORT))) return 0;
+    if ((rule->match_mask & MATCH_SRC_IP) && (((pkt->src_ip & rule->src_mask) == (rule->src_ip & rule->src_mask)) == !!(rule->invert_mask & MATCH_SRC_IP))) return 0;
+    if ((rule->match_mask & MATCH_DST_IP) && (((pkt->dst_ip & rule->dst_mask) == (rule->dst_ip & rule->dst_mask)) == !!(rule->invert_mask & MATCH_DST_IP))) return 0;
+    if ((rule->match_mask & MATCH_SRC_PORT) && (((pkt->src_port >= rule->src_port_start && pkt->src_port <= rule->src_port_end)) == !!(rule->invert_mask & MATCH_SRC_PORT))) return 0;
+    if ((rule->match_mask & MATCH_DST_PORT) && (((pkt->dst_port >= rule->dst_port_start && pkt->dst_port <= rule->dst_port_end)) == !!(rule->invert_mask & MATCH_DST_PORT))) return 0;
     if ((rule->match_mask & MATCH_PROTO) && ((pkt->proto == rule->proto) == !!(rule->invert_mask & MATCH_PROTO))) return 0;
     if ((rule->match_mask & MATCH_DIRECTION) && ((direction == rule->direction) == !!(rule->invert_mask & MATCH_DIRECTION))) return 0;
     if ((rule->match_mask & MATCH_TTL) && ((pkt->ttl == rule->ttl) == !!(rule->invert_mask & MATCH_TTL))) return 0;
@@ -299,19 +282,21 @@ static __always_inline int matches_rule_ipv6(struct parsed_packet *pkt, struct f
     if (rule->match_mask & MATCH_SRC_IP) {
         __u64 *p1 = (__u64 *)pkt->src_ip6;
         __u64 *r1 = (__u64 *)rule->src_ip;
-        int ip_match = (p1[0] == r1[0] && p1[1] == r1[1]);
+        __u64 *m1 = (__u64 *)rule->src_mask;
+        int ip_match = ((p1[0] & m1[0]) == (r1[0] & m1[0])) && ((p1[1] & m1[1]) == (r1[1] & m1[1]));
         if (ip_match == !!(rule->invert_mask & MATCH_SRC_IP)) return 0;
     }
 
     if (rule->match_mask & MATCH_DST_IP) {
         __u64 *p2 = (__u64 *)pkt->dst_ip6;
         __u64 *r2 = (__u64 *)rule->dst_ip;
-        int ip_match = (p2[0] == r2[0] && p2[1] == r2[1]);
+        __u64 *m2 = (__u64 *)rule->dst_mask;
+        int ip_match = ((p2[0] & m2[0]) == (r2[0] & m2[0])) && ((p2[1] & m2[1]) == (r2[1] & m2[1]));
         if (ip_match == !!(rule->invert_mask & MATCH_DST_IP)) return 0;
     }
 
-    if ((rule->match_mask & MATCH_SRC_PORT) && ((pkt->src_port == rule->src_port) == !!(rule->invert_mask & MATCH_SRC_PORT))) return 0;
-    if ((rule->match_mask & MATCH_DST_PORT) && ((pkt->dst_port == rule->dst_port) == !!(rule->invert_mask & MATCH_DST_PORT))) return 0;
+    if ((rule->match_mask & MATCH_SRC_PORT) && (((pkt->src_port >= rule->src_port_start && pkt->src_port <= rule->src_port_end)) == !!(rule->invert_mask & MATCH_SRC_PORT))) return 0;
+    if ((rule->match_mask & MATCH_DST_PORT) && (((pkt->dst_port >= rule->dst_port_start && pkt->dst_port <= rule->dst_port_end)) == !!(rule->invert_mask & MATCH_DST_PORT))) return 0;
     if ((rule->match_mask & MATCH_PROTO) && ((pkt->proto == rule->proto) == !!(rule->invert_mask & MATCH_PROTO))) return 0;
     if ((rule->match_mask & MATCH_DIRECTION) && ((direction == rule->direction) == !!(rule->invert_mask & MATCH_DIRECTION))) return 0;
     if ((rule->match_mask & MATCH_TTL) && ((pkt->ttl == rule->ttl) == !!(rule->invert_mask & MATCH_TTL))) return 0;
@@ -342,13 +327,14 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
     bpf_skb_pull_data(skb, 64);
 
     struct parsed_packet pkt = {0};
-    parse_packet(skb, &pkt);
+    if (!parse_packet(skb, &pkt)) {
+        increment_stat(STAT_PARSING_ERR);
+    }
 
     int matched = 0;
     __u16 match_mask = 0;
 
     // 1. Process IPv4/Generic rules
-    #pragma unroll
     for (__u32 i = 0; i < MAX_RULES; i++) {
         __u32 k = i;
         struct filter_rule *rule = bpf_map_lookup_elem(&filter_rules, &k);
@@ -362,7 +348,6 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
 
     // 2. Process IPv6-specific rules (if packet is IPv6 and no generic rule matched)
     if (!matched && pkt.parsed_ok && pkt.ver == 6) {
-        #pragma unroll
         for (__u32 i = 0; i < MAX_RULES; i++) {
             __u32 k = i;
             struct filter_rule_ipv6 *rule = bpf_map_lookup_elem(&filter_rules_ipv6, &k);
@@ -383,7 +368,10 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
     }
 
     struct divert_packet_buffer *buf = bpf_ringbuf_reserve(&pcap_ringbuf, sizeof(struct divert_packet_buffer), 0);
-    if (!buf) return TC_ACT_UNSPEC;
+    if (!buf) {
+        increment_stat(STAT_RINGBUF_FULL);
+        return TC_ACT_UNSPEC;
+    }
 
     buf->header.pkt_len = skb->len;
     buf->header.ifindex = skb->ifindex;
