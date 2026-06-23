@@ -77,6 +77,8 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
     void *data_end = (void *)(long)skb->data_end;
     void *data = (void *)(long)skb->data;
 
+    bpf_printk("parse_packet: len=%d, proto=%x, data_len=%d", skb->len, bpf_ntohs(skb->protocol), (int)(data_end - data));
+
     __u16 l2_len = 0;
     int found = 0;
 
@@ -84,6 +86,8 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
     // 1. Try Ethernet (14 bytes)
     if (data + 14 <= data_end) {
         __u16 ethertype = bpf_ntohs(*(__u16 *)((char *)data + 12));
+        bpf_printk("  14B check: %02x %02x %02x %02x ... ethertype=%x", 
+                   *(__u8 *)data, *((__u8 *)data+1), *((__u8 *)data+2), *((__u8 *)data+3), ethertype);
         if (ethertype == 0x0800 || ethertype == 0x86DD) {
             l2_len = 14;
             found = 1;
@@ -341,7 +345,11 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
         if (my_prio <= inject_prio) return TC_ACT_UNSPEC;
     }
 
-    if (bpf_skb_pull_data(skb, 128) < 0) {
+    __u32 pull_len = skb->len;
+    if (pull_len > 128) {
+        pull_len = 128;
+    }
+    if (bpf_skb_pull_data(skb, pull_len) < 0) {
         increment_stat(STAT_PARSING_ERR);
         return TC_ACT_UNSPEC;
     }
@@ -397,12 +405,13 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
     buf->header.ifindex = skb->ifindex;
     buf->header.direction = (__u16)direction;
     buf->header.l2_len = pkt.parsed_ok ? pkt.l2_len : 0;
-    buf->header.pad = 0xDEADC0DE;
 
     __u32 to_load = skb->len;
     __u32 max_len = snap;
     if (max_len > 2048) max_len = 2048;
     if (to_load > max_len) to_load = max_len;
+
+    buf->header.cap_len = to_load;
     if (to_load > 0) {
         int ret = bpf_skb_load_bytes(skb, 0, buf->data, ((to_load - 1) & 0x7FF) + 1);
         if (ret < 0) {
@@ -433,4 +442,4 @@ int tc_divert_egress(struct __sk_buff *skb) {
     return process_packet(skb, 2);
 }
 
-char _license[] SEC("license") = "Dual GPL/LGPL";
+char _license[] SEC("license") = "GPL";

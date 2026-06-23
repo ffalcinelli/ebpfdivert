@@ -603,8 +603,9 @@ struct ebpfdivert_handle {
     int curr_received;
 
     // Cache of interface-specific raw sockets for TX ring injection
-    struct if_sock_entry socks[16];
+    struct if_sock_entry *socks;
     int socks_count;
+    int socks_capacity;
 };
 
 static int ebpfdivert_rb_callback(void *ctx, void *data, size_t size) {
@@ -643,6 +644,15 @@ ebpfdivert_handle_t *ebpfdivert_open(uint32_t priority) {
         return NULL;
     }
     
+    h->socks_capacity = 16;
+    h->socks = calloc(h->socks_capacity, sizeof(struct if_sock_entry));
+    if (!h->socks) {
+        fprintf(stderr, "ERROR: failed to allocate raw sockets cache\n");
+        ring_buffer__free(h->rb);
+        close(h->ringbuf_fd);
+        free(h);
+        return NULL;
+    }
     h->socks_count = 0;
     return h;
 }
@@ -679,6 +689,14 @@ int ebpfdivert_send(ebpfdivert_handle_t *h, const struct divert_packet_buffer *b
     int ifindex = buf->header.ifindex;
     if (ifindex <= 0) return -EINVAL;
     
+    size_t to_send = buf->header.cap_len;
+    if (to_send > buf->header.pkt_len) {
+        to_send = buf->header.pkt_len;
+    }
+    if (to_send > 2048) {
+        to_send = 2048;
+    }
+    
     int sock_idx = -1;
     for (int i = 0; i < h->socks_count; i++) {
         if (h->socks[i].ifindex == ifindex) {
@@ -688,8 +706,15 @@ int ebpfdivert_send(ebpfdivert_handle_t *h, const struct divert_packet_buffer *b
     }
     
     if (sock_idx == -1) {
-        if (h->socks_count >= 16) {
-            return -ENOSPC;
+        if (h->socks_count >= h->socks_capacity) {
+            int new_capacity = h->socks_capacity * 2;
+            struct if_sock_entry *new_socks = realloc(h->socks, new_capacity * sizeof(struct if_sock_entry));
+            if (!new_socks) {
+                return -ENOMEM;
+            }
+            h->socks = new_socks;
+            memset(&h->socks[h->socks_capacity], 0, (new_capacity - h->socks_capacity) * sizeof(struct if_sock_entry));
+            h->socks_capacity = new_capacity;
         }
         int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
         if (sock < 0) {
@@ -712,71 +737,19 @@ int ebpfdivert_send(ebpfdivert_handle_t *h, const struct divert_packet_buffer *b
             return -errno;
         }
         
-        uint8_t *tx_ring = NULL;
-        struct tpacket_req req = {
-            .tp_block_size = 16384,
-            .tp_block_nr = 8,
-            .tp_frame_size = 2048,
-            .tp_frame_nr = 64
-        };
-        if (setsockopt(sock, SOL_PACKET, PACKET_TX_RING, &req, sizeof(req)) == 0) {
-            size_t ring_len = (size_t)req.tp_block_size * (size_t)req.tp_block_nr;
-            tx_ring = mmap(NULL, ring_len, PROT_READ | PROT_WRITE, MAP_SHARED, sock, 0);
-            if (tx_ring == MAP_FAILED) {
-                tx_ring = NULL;
-            }
-        }
-        
+
         sock_idx = h->socks_count;
         h->socks[sock_idx].ifindex = ifindex;
         h->socks[sock_idx].sock = sock;
-        h->socks[sock_idx].tx_ring = tx_ring;
+        h->socks[sock_idx].tx_ring = NULL;
         h->socks[sock_idx].tx_index = 0;
         h->socks_count++;
     }
     
     int sock = h->socks[sock_idx].sock;
-    uint8_t *tx_ring = h->socks[sock_idx].tx_ring;
-    
-    if (tx_ring) {
-        uint32_t frame_size = 2048;
-        uint32_t frame_nr = 64;
-        uint32_t idx = h->socks[sock_idx].tx_index;
-        
-        struct tpacket_hdr *hdr = (struct tpacket_hdr *)(tx_ring + idx * frame_size);
-        
-        int retries = 1000;
-        while (hdr->tp_status != TP_STATUS_AVAILABLE && retries > 0) {
-            usleep(1);
-            retries--;
-        }
-        
-        if (hdr->tp_status != TP_STATUS_AVAILABLE) {
-            goto fallback_send;
-        }
-        
-        uint8_t *frame_data = (uint8_t *)hdr + TPACKET_HDRLEN;
-        size_t to_copy = buf->header.pkt_len;
-        if (to_copy > 2048 - TPACKET_HDRLEN) {
-            to_copy = 2048 - TPACKET_HDRLEN;
-        }
-        memcpy(frame_data, buf->data, to_copy);
-        
-        hdr->tp_len = to_copy;
-        hdr->tp_status = TP_STATUS_SENDING;
-        
-        ssize_t sent = send(sock, NULL, 0, MSG_DONTWAIT);
-        if (sent < 0 && errno != EAGAIN && errno != ENOBUFS) {
-            return -errno;
-        }
-        
-        h->socks[sock_idx].tx_index = (idx + 1) % frame_nr;
-    } else {
-    fallback_send: ;
-        ssize_t sent = send(sock, buf->data, buf->header.pkt_len, 0);
-        if (sent < 0) {
-            return -errno;
-        }
+    ssize_t sent = send(sock, buf->data, to_send, 0);
+    if (sent < 0) {
+        return -errno;
     }
     
     return 0;
@@ -790,6 +763,7 @@ void ebpfdivert_close(ebpfdivert_handle_t *h) {
         }
         close(h->socks[i].sock);
     }
+    free(h->socks);
     if (h->rb) {
         ring_buffer__free(h->rb);
     }

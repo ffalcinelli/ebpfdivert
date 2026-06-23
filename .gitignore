@@ -57,3 +57,5 @@ dkms.conf
 *.swp
 *~
 ebpfdivert-cli
+tracelog.txt
+test_integration

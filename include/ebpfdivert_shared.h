@@ -35,7 +35,7 @@ struct divert_pkt_header {
     __u32 ifindex;
     __u16 direction;
     __u16 l2_len;
-    __u32 pad;
+    __u32 cap_len;
 } __attribute__((packed));
 
 struct divert_packet_buffer {

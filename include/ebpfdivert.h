@@ -19,6 +19,12 @@ int ebpfdivert_get_stats(uint64_t *stats, int stats_len);
 struct ebpfdivert_handle;
 typedef struct ebpfdivert_handle ebpfdivert_handle_t;
 
+/*
+ * NOTE on Thread Safety:
+ * ebpfdivert_handle_t handles are not thread-safe. Concurrently invoking ebpfdivert_recv
+ * or ebpfdivert_send on the same handle across multiple threads without external
+ * synchronization (e.g. mutex locking) will lead to race conditions or data corruption.
+ */
 ebpfdivert_handle_t *ebpfdivert_open(uint32_t priority);
 int ebpfdivert_recv(ebpfdivert_handle_t *h, struct divert_packet_buffer *buf, size_t buf_len, int timeout_ms);
 int ebpfdivert_send(ebpfdivert_handle_t *h, const struct divert_packet_buffer *buf);

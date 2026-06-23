@@ -85,7 +85,7 @@ static void write_pcap_packet(FILE *f, const struct divert_packet_buffer *buf) {
     struct pcaprec_hdr phdr = {
         .ts_sec = (uint32_t)tv.tv_sec,
         .ts_usec = (uint32_t)tv.tv_usec,
-        .incl_len = buf->header.pkt_len > 2048 ? 2048 : buf->header.pkt_len,
+        .incl_len = buf->header.cap_len,
         .orig_len = buf->header.pkt_len
     };
     fwrite(&phdr, sizeof(phdr), 1, f);

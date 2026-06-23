@@ -177,8 +177,8 @@ void run_bpf_test_packet(int prog_fd, struct ring_buffer *rb, const char *msg,
                 printf("  [FAIL] %s: ringbuf l2_len mismatch (expected %u, got %u)\n", msg, expected_l2_len, g_last_rb_pkt.pkt.header.l2_len);
                 exit(1);
             }
-            if (g_last_rb_pkt.pkt.header.pad != 0xDEADC0DE) {
-                printf("  [FAIL] %s: ringbuf header pad mismatch (expected 0xDEADC0DE, got 0x%X)\n", msg, g_last_rb_pkt.pkt.header.pad);
+            if (g_last_rb_pkt.pkt.header.cap_len != pkt_len) {
+                printf("  [FAIL] %s: ringbuf cap_len mismatch (expected %zu, got %u)\n", msg, pkt_len, g_last_rb_pkt.pkt.header.cap_len);
                 exit(1);
             }
         } else {
