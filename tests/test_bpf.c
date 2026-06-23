@@ -12,6 +12,7 @@
 #include "ebpfdivert_shared.h"
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
+    (void)level;
     return vfprintf(stderr, format, args);
 }
 
@@ -115,6 +116,7 @@ struct last_rb_pkt {
 static struct last_rb_pkt g_last_rb_pkt;
 
 static int handle_ringbuf_sample(void *ctx, void *data, size_t size) {
+    (void)ctx;
     if (size > sizeof(struct divert_packet_buffer)) {
         size = sizeof(struct divert_packet_buffer);
     }
@@ -150,8 +152,8 @@ void run_bpf_test_packet(int prog_fd, struct ring_buffer *rb, const char *msg,
         exit(1);
     }
 
-    if (opts.retval != expected_retval) {
-        printf("  [FAIL] %s: expected retval=%d, got %d\n", msg, expected_retval, opts.retval);
+    if ((int)opts.retval != expected_retval) {
+        printf("  [FAIL] %s: expected retval=%d, got %d\n", msg, expected_retval, (int)opts.retval);
         exit(1);
     }
 

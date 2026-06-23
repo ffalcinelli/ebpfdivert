@@ -30,7 +30,6 @@ static void cleanup_pinned_resources(void) {
 
 static int attach_tc_hooks(int ifindex, struct bpf_program *prog_ingress, struct bpf_program *prog_egress) {
     DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook_ingress,
-        .sz = sizeof(struct bpf_tc_hook),
         .ifindex = ifindex,
         .attach_point = BPF_TC_INGRESS
     );
@@ -38,7 +37,6 @@ static int attach_tc_hooks(int ifindex, struct bpf_program *prog_ingress, struct
     bpf_tc_hook_create(&hook_ingress);
 
     DECLARE_LIBBPF_OPTS(bpf_tc_opts, opts_ingress,
-        .sz = sizeof(struct bpf_tc_opts),
         .prog_fd = bpf_program__fd(prog_ingress)
     );
 
@@ -50,7 +48,6 @@ static int attach_tc_hooks(int ifindex, struct bpf_program *prog_ingress, struct
     }
 
     DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook_egress,
-        .sz = sizeof(struct bpf_tc_hook),
         .ifindex = ifindex,
         .attach_point = BPF_TC_EGRESS
     );
@@ -58,7 +55,6 @@ static int attach_tc_hooks(int ifindex, struct bpf_program *prog_ingress, struct
     bpf_tc_hook_create(&hook_egress);
 
     DECLARE_LIBBPF_OPTS(bpf_tc_opts, opts_egress,
-        .sz = sizeof(struct bpf_tc_opts),
         .prog_fd = bpf_program__fd(prog_egress)
     );
 
@@ -66,7 +62,6 @@ static int attach_tc_hooks(int ifindex, struct bpf_program *prog_ingress, struct
     if (err && err != -EEXIST) {
         fprintf(stderr, "ERROR: attaching egress program to ifindex %d failed: %s\n", ifindex, strerror(-err));
         DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook_ingress_del,
-            .sz = sizeof(struct bpf_tc_hook),
             .ifindex = ifindex,
             .attach_point = BPF_TC_INGRESS
         );
@@ -81,7 +76,6 @@ static int attach_tc_hooks(int ifindex, struct bpf_program *prog_ingress, struct
 
 static int detach_tc_hooks(int ifindex) {
     DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook,
-        .sz = sizeof(struct bpf_tc_hook),
         .ifindex = ifindex,
         .attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS
     );
@@ -270,8 +264,8 @@ int ebpfdivert_rules_list(void) {
     }
 
     printf("IPv4/Generic Rules:\n");
-    printf("IDX | Proto | Action | Dst Port Range | Dst IP/Mask\n");
-    printf("---------------------------------------------------\n");
+    printf("IDX | Proto | Action | Dst Port Range | Dst IP/Mask          | Advanced Match Details\n");
+    printf("--------------------------------------------------------------------------------------\n");
     for (__u32 i = 0; i < MAX_RULES; i++) {
         struct filter_rule rule;
         if (bpf_map_lookup_elem(map_fd, &i, &rule) == 0) {
@@ -302,16 +296,59 @@ int ebpfdivert_rules_list(void) {
             if (rule.match_mask & MATCH_DST_IP) {
                 struct in_addr ip_addr = { .s_addr = htonl(rule.dst_ip) };
                 struct in_addr mask_addr = { .s_addr = htonl(rule.dst_mask) };
-                snprintf(ip_str, sizeof(ip_str), "%s/%s", inet_ntoa(ip_addr), inet_ntoa(mask_addr));
+                char ip_buf[32];
+                char mask_buf[32];
+                snprintf(ip_buf, sizeof(ip_buf), "%s", inet_ntoa(ip_addr));
+                snprintf(mask_buf, sizeof(mask_buf), "%s", inet_ntoa(mask_addr));
+                snprintf(ip_str, sizeof(ip_str), "%s/%s", ip_buf, mask_buf);
             }
 
-            printf("%-3u | %-5s | %-6s | %-14s | %s\n", i, proto_str, action_str, port_str, ip_str);
+            char details[256] = "";
+            if (rule.match_mask & MATCH_SRC_IP) {
+                struct in_addr ip_addr = { .s_addr = htonl(rule.src_ip) };
+                struct in_addr mask_addr = { .s_addr = htonl(rule.src_mask) };
+                char ip_buf[32];
+                char mask_buf[32];
+                snprintf(ip_buf, sizeof(ip_buf), "%s", inet_ntoa(ip_addr));
+                snprintf(mask_buf, sizeof(mask_buf), "%s", inet_ntoa(mask_addr));
+                char buf[128];
+                snprintf(buf, sizeof(buf), "src_ip=%s/%s ", ip_buf, mask_buf);
+                strcat(details, buf);
+            }
+            if (rule.match_mask & MATCH_SRC_PORT) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "src_port=%u-%u ", rule.src_port_start, rule.src_port_end);
+                strcat(details, buf);
+            }
+            if (rule.match_mask & MATCH_DIRECTION) {
+                strcat(details, rule.direction == 1 ? "dir=ingress " : "dir=egress ");
+            }
+            if (rule.match_mask & MATCH_LOOPBACK) {
+                strcat(details, rule.loopback ? "loopback=yes " : "loopback=no ");
+            }
+            if (rule.match_mask & MATCH_TTL) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "ttl=%u ", rule.ttl);
+                strcat(details, buf);
+            }
+            if (rule.match_mask & MATCH_TCP_FLAGS) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "tcp_flags=0x%02x/0x%02x ", rule.tcp_flags, rule.tcp_flags_mask);
+                strcat(details, buf);
+            }
+            if (rule.invert_mask) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "invert=0x%04x ", rule.invert_mask);
+                strcat(details, buf);
+            }
+
+            printf("%-3u | %-5s | %-6s | %-14s | %-20s | %s\n", i, proto_str, action_str, port_str, ip_str, details);
         }
     }
 
     printf("\nIPv6-specific Rules:\n");
-    printf("IDX | Proto | Action | Dst Port Range | Dst IP/Mask\n");
-    printf("---------------------------------------------------\n");
+    printf("IDX | Proto | Action | Dst Port Range | Dst IP/Mask          | Advanced Match Details\n");
+    printf("--------------------------------------------------------------------------------------\n");
     for (__u32 i = 0; i < MAX_RULES; i++) {
         struct filter_rule_ipv6 rule;
         if (bpf_map_lookup_elem(map_fd_v6, &i, &rule) == 0) {
@@ -347,12 +384,439 @@ int ebpfdivert_rules_list(void) {
                 snprintf(ip_str, sizeof(ip_str), "%s/%s", ip_addr_str, mask_addr_str);
             }
 
-            printf("%-3u | %-5s | %-6s | %-14s | %s\n", i, proto_str, action_str, port_str, ip_str);
+            char details[256] = "";
+            if (rule.match_mask & MATCH_SRC_IP) {
+                char ip_addr_str[64];
+                char mask_addr_str[64];
+                inet_ntop(AF_INET6, rule.src_ip, ip_addr_str, sizeof(ip_addr_str));
+                inet_ntop(AF_INET6, rule.src_mask, mask_addr_str, sizeof(mask_addr_str));
+                char buf[256];
+                snprintf(buf, sizeof(buf), "src_ip=%s/%s ", ip_addr_str, mask_addr_str);
+                strcat(details, buf);
+            }
+            if (rule.match_mask & MATCH_SRC_PORT) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "src_port=%u-%u ", rule.src_port_start, rule.src_port_end);
+                strcat(details, buf);
+            }
+            if (rule.match_mask & MATCH_DIRECTION) {
+                strcat(details, rule.direction == 1 ? "dir=ingress " : "dir=egress ");
+            }
+            if (rule.match_mask & MATCH_LOOPBACK) {
+                strcat(details, rule.loopback ? "loopback=yes " : "loopback=no ");
+            }
+            if (rule.match_mask & MATCH_TTL) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "ttl=%u ", rule.ttl);
+                strcat(details, buf);
+            }
+            if (rule.match_mask & MATCH_TCP_FLAGS) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "tcp_flags=0x%02x/0x%02x ", rule.tcp_flags, rule.tcp_flags_mask);
+                strcat(details, buf);
+            }
+            if (rule.invert_mask) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "invert=0x%04x ", rule.invert_mask);
+                strcat(details, buf);
+            }
+
+            printf("%-3u | %-5s | %-6s | %-14s | %-20s | %s\n", i, proto_str, action_str, port_str, ip_str, details);
         }
     }
 
     close(map_fd);
     close(map_fd_v6);
+    return 0;
+}
+
+static int is_option_active(const char *val) {
+    return val && strcmp(val, "any") != 0 && strlen(val) > 0;
+}
+
+static uint8_t parse_tcp_flags(const char *str) {
+    if (!str) return 0;
+    if (str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
+        return (uint8_t)strtol(str, NULL, 16);
+    }
+    uint8_t flags = 0;
+    char temp[64];
+    snprintf(temp, sizeof(temp), "%s", str);
+    char *token = strtok(temp, ", |");
+    while (token) {
+        if (strcasecmp(token, "FIN") == 0) flags |= 0x01;
+        else if (strcasecmp(token, "SYN") == 0) flags |= 0x02;
+        else if (strcasecmp(token, "RST") == 0) flags |= 0x04;
+        else if (strcasecmp(token, "PSH") == 0) flags |= 0x08;
+        else if (strcasecmp(token, "ACK") == 0) flags |= 0x10;
+        else if (strcasecmp(token, "URG") == 0) flags |= 0x20;
+        else if (strcasecmp(token, "ECE") == 0) flags |= 0x40;
+        else if (strcasecmp(token, "CWR") == 0) flags |= 0x80;
+        token = strtok(NULL, ", |");
+    }
+    return flags;
+}
+
+int ebpfdivert_rules_add_extended(int idx, const struct ebpfdivert_rule_opt *opt) {
+    if (!opt) {
+        fprintf(stderr, "ERROR: invalid NULL opt argument\n");
+        return -1;
+    }
+
+    int map_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/filter_rules");
+    int map_fd_v6 = bpf_obj_get("/sys/fs/bpf/ebpfdivert/filter_rules_ipv6");
+    if (map_fd < 0 || map_fd_v6 < 0) {
+        fprintf(stderr, "ERROR: eBPFDivert maps not found. Is the driver loaded?\n");
+        if (map_fd >= 0) close(map_fd);
+        if (map_fd_v6 >= 0) close(map_fd_v6);
+        return -1;
+    }
+
+    if (idx < 0 || idx >= MAX_RULES) {
+        fprintf(stderr, "ERROR: rule index must be between 0 and %d\n", MAX_RULES - 1);
+        close(map_fd);
+        close(map_fd_v6);
+        return -1;
+    }
+
+    int is_ipv6 = 0;
+    if ((opt->src_ip_cidr && strchr(opt->src_ip_cidr, ':')) ||
+        (opt->dst_ip_cidr && strchr(opt->dst_ip_cidr, ':')) ||
+        (opt->proto && strcmp(opt->proto, "icmpv6") == 0)) {
+        is_ipv6 = 1;
+    }
+
+    if (!is_ipv6) {
+        struct filter_rule rule = {0};
+        rule.match_mask = MATCH_ENABLED;
+
+        if (is_option_active(opt->proto)) {
+            rule.match_mask |= MATCH_PROTO;
+            if (strcasecmp(opt->proto, "tcp") == 0) rule.proto = 6;
+            else if (strcasecmp(opt->proto, "udp") == 0) rule.proto = 17;
+            else if (strcasecmp(opt->proto, "icmp") == 0) rule.proto = 1;
+            else rule.proto = atoi(opt->proto);
+        }
+
+        if (opt->action) {
+            if (strcmp(opt->action, "drop") == 0) rule.match_mask |= MATCH_DROP;
+            else if (strcmp(opt->action, "sniff") == 0) rule.match_mask |= MATCH_SNIFF;
+        }
+
+        if (is_option_active(opt->src_ip_cidr)) {
+            rule.match_mask |= MATCH_SRC_IP;
+            char ip_str[64];
+            snprintf(ip_str, sizeof(ip_str), "%s", opt->src_ip_cidr);
+            char *slash = strchr(ip_str, '/');
+            int bits = 32;
+            if (slash) {
+                *slash = '\0';
+                bits = atoi(slash + 1);
+            }
+            unsigned long addr = inet_addr(ip_str);
+            if (addr == INADDR_NONE) {
+                fprintf(stderr, "ERROR: invalid IP address '%s'\n", ip_str);
+                close(map_fd);
+                close(map_fd_v6);
+                return -1;
+            }
+            if (bits < 0 || bits > 32) {
+                fprintf(stderr, "ERROR: invalid CIDR mask bits %d\n", bits);
+                close(map_fd);
+                close(map_fd_v6);
+                return -1;
+            }
+            rule.src_ip = ntohl(addr);
+            if (bits >= 32) rule.src_mask = 0xFFFFFFFF;
+            else if (bits <= 0) rule.src_mask = 0;
+            else rule.src_mask = (0xFFFFFFFF << (32 - bits));
+        }
+
+        if (is_option_active(opt->dst_ip_cidr)) {
+            rule.match_mask |= MATCH_DST_IP;
+            char ip_str[64];
+            snprintf(ip_str, sizeof(ip_str), "%s", opt->dst_ip_cidr);
+            char *slash = strchr(ip_str, '/');
+            int bits = 32;
+            if (slash) {
+                *slash = '\0';
+                bits = atoi(slash + 1);
+            }
+            unsigned long addr = inet_addr(ip_str);
+            if (addr == INADDR_NONE) {
+                fprintf(stderr, "ERROR: invalid IP address '%s'\n", ip_str);
+                close(map_fd);
+                close(map_fd_v6);
+                return -1;
+            }
+            if (bits < 0 || bits > 32) {
+                fprintf(stderr, "ERROR: invalid CIDR mask bits %d\n", bits);
+                close(map_fd);
+                close(map_fd_v6);
+                return -1;
+            }
+            rule.dst_ip = ntohl(addr);
+            if (bits >= 32) rule.dst_mask = 0xFFFFFFFF;
+            else if (bits <= 0) rule.dst_mask = 0;
+            else rule.dst_mask = (0xFFFFFFFF << (32 - bits));
+        }
+
+        if (is_option_active(opt->src_port_range) && rule.proto != 1) {
+            rule.match_mask |= MATCH_SRC_PORT;
+            char pr_str[32];
+            snprintf(pr_str, sizeof(pr_str), "%s", opt->src_port_range);
+            char *dash = strchr(pr_str, '-');
+            if (dash) {
+                *dash = '\0';
+                rule.src_port_start = atoi(pr_str);
+                rule.src_port_end = atoi(dash + 1);
+            } else {
+                int p = atoi(pr_str);
+                rule.src_port_start = p;
+                rule.src_port_end = p;
+            }
+        }
+
+        if (is_option_active(opt->dst_port_range)) {
+            rule.match_mask |= MATCH_DST_PORT;
+            if (rule.proto == 1) {
+                char pr_str[32];
+                snprintf(pr_str, sizeof(pr_str), "%s", opt->dst_port_range);
+                char *slash = strchr(pr_str, '/');
+                int type = atoi(pr_str);
+                int code = 0;
+                if (slash) {
+                    code = atoi(slash + 1);
+                }
+                rule.icmp_type_start = type;
+                rule.icmp_type_end = type;
+                rule.icmp_code_start = code;
+                rule.icmp_code_end = code;
+            } else {
+                char pr_str[32];
+                snprintf(pr_str, sizeof(pr_str), "%s", opt->dst_port_range);
+                char *dash = strchr(pr_str, '-');
+                if (dash) {
+                    *dash = '\0';
+                    rule.dst_port_start = atoi(pr_str);
+                    rule.dst_port_end = atoi(dash + 1);
+                } else {
+                    int p = atoi(pr_str);
+                    rule.dst_port_start = p;
+                    rule.dst_port_end = p;
+                }
+            }
+        }
+
+        if (is_option_active(opt->direction)) {
+            rule.match_mask |= MATCH_DIRECTION;
+            if (strcasecmp(opt->direction, "ingress") == 0) rule.direction = 1;
+            else if (strcasecmp(opt->direction, "egress") == 0) rule.direction = 2;
+        }
+
+        if (is_option_active(opt->loopback)) {
+            rule.match_mask |= MATCH_LOOPBACK;
+            if (strcasecmp(opt->loopback, "yes") == 0) rule.loopback = 1;
+            else if (strcasecmp(opt->loopback, "no") == 0) rule.loopback = 0;
+        }
+
+        if (is_option_active(opt->ttl)) {
+            rule.match_mask |= MATCH_TTL;
+            rule.ttl = (uint8_t)atoi(opt->ttl);
+        }
+
+        if (is_option_active(opt->tcp_flags)) {
+            rule.match_mask |= MATCH_TCP_FLAGS;
+            rule.tcp_flags = parse_tcp_flags(opt->tcp_flags);
+            if (is_option_active(opt->tcp_flags_mask)) {
+                rule.tcp_flags_mask = parse_tcp_flags(opt->tcp_flags_mask);
+            } else {
+                rule.tcp_flags_mask = 0xFF;
+            }
+        }
+
+        rule.invert_mask = opt->invert_mask;
+
+        if (bpf_map_update_elem(map_fd, &idx, &rule, BPF_ANY)) {
+            fprintf(stderr, "ERROR: updating filter_rules map failed: %s\n", strerror(errno));
+            close(map_fd);
+            close(map_fd_v6);
+            return -1;
+        }
+    } else {
+        struct filter_rule_ipv6 rule = {0};
+        rule.match_mask = MATCH_ENABLED;
+
+        if (is_option_active(opt->proto)) {
+            rule.match_mask |= MATCH_PROTO;
+            if (strcasecmp(opt->proto, "tcp") == 0) rule.proto = 6;
+            else if (strcasecmp(opt->proto, "udp") == 0) rule.proto = 17;
+            else if (strcasecmp(opt->proto, "icmpv6") == 0) rule.proto = 58;
+            else rule.proto = atoi(opt->proto);
+        }
+
+        if (opt->action) {
+            if (strcmp(opt->action, "drop") == 0) rule.match_mask |= MATCH_DROP;
+            else if (strcmp(opt->action, "sniff") == 0) rule.match_mask |= MATCH_SNIFF;
+        }
+
+        if (is_option_active(opt->src_ip_cidr)) {
+            rule.match_mask |= MATCH_SRC_IP;
+            char ip_str[128];
+            snprintf(ip_str, sizeof(ip_str), "%s", opt->src_ip_cidr);
+            char *slash = strchr(ip_str, '/');
+            int bits = 128;
+            if (slash) {
+                *slash = '\0';
+                bits = atoi(slash + 1);
+            }
+            if (inet_pton(AF_INET6, ip_str, rule.src_ip) != 1) {
+                fprintf(stderr, "ERROR: invalid IPv6 address '%s'\n", ip_str);
+                close(map_fd);
+                close(map_fd_v6);
+                return -1;
+            }
+            if (bits < 0 || bits > 128) {
+                fprintf(stderr, "ERROR: invalid IPv6 CIDR mask bits %d\n", bits);
+                close(map_fd);
+                close(map_fd_v6);
+                return -1;
+            }
+            for (int i = 0; i < 16; i++) {
+                if (bits >= 8) {
+                    rule.src_mask[i] = 0xFF;
+                    bits -= 8;
+                } else if (bits > 0) {
+                    rule.src_mask[i] = (0xFF << (8 - bits));
+                    bits = 0;
+                } else {
+                    rule.src_mask[i] = 0;
+                }
+            }
+        }
+
+        if (is_option_active(opt->dst_ip_cidr)) {
+            rule.match_mask |= MATCH_DST_IP;
+            char ip_str[128];
+            snprintf(ip_str, sizeof(ip_str), "%s", opt->dst_ip_cidr);
+            char *slash = strchr(ip_str, '/');
+            int bits = 128;
+            if (slash) {
+                *slash = '\0';
+                bits = atoi(slash + 1);
+            }
+            if (inet_pton(AF_INET6, ip_str, rule.dst_ip) != 1) {
+                fprintf(stderr, "ERROR: invalid IPv6 address '%s'\n", ip_str);
+                close(map_fd);
+                close(map_fd_v6);
+                return -1;
+            }
+            if (bits < 0 || bits > 128) {
+                fprintf(stderr, "ERROR: invalid IPv6 CIDR mask bits %d\n", bits);
+                close(map_fd);
+                close(map_fd_v6);
+                return -1;
+            }
+            for (int i = 0; i < 16; i++) {
+                if (bits >= 8) {
+                    rule.dst_mask[i] = 0xFF;
+                    bits -= 8;
+                } else if (bits > 0) {
+                    rule.dst_mask[i] = (0xFF << (8 - bits));
+                    bits = 0;
+                } else {
+                    rule.dst_mask[i] = 0;
+                }
+            }
+        }
+
+        if (is_option_active(opt->src_port_range) && rule.proto != 58) {
+            rule.match_mask |= MATCH_SRC_PORT;
+            char pr_str[32];
+            snprintf(pr_str, sizeof(pr_str), "%s", opt->src_port_range);
+            char *dash = strchr(pr_str, '-');
+            if (dash) {
+                *dash = '\0';
+                rule.src_port_start = atoi(pr_str);
+                rule.src_port_end = atoi(dash + 1);
+            } else {
+                int p = atoi(pr_str);
+                rule.src_port_start = p;
+                rule.src_port_end = p;
+            }
+        }
+
+        if (is_option_active(opt->dst_port_range)) {
+            rule.match_mask |= MATCH_DST_PORT;
+            if (rule.proto == 58) {
+                char pr_str[32];
+                snprintf(pr_str, sizeof(pr_str), "%s", opt->dst_port_range);
+                char *slash = strchr(pr_str, '/');
+                int type = atoi(pr_str);
+                int code = 0;
+                if (slash) {
+                    code = atoi(slash + 1);
+                }
+                rule.icmp_type_start = type;
+                rule.icmp_type_end = type;
+                rule.icmp_code_start = code;
+                rule.icmp_code_end = code;
+            } else {
+                char pr_str[32];
+                snprintf(pr_str, sizeof(pr_str), "%s", opt->dst_port_range);
+                char *dash = strchr(pr_str, '-');
+                if (dash) {
+                    *dash = '\0';
+                    rule.dst_port_start = atoi(pr_str);
+                    rule.dst_port_end = atoi(dash + 1);
+                } else {
+                    int p = atoi(pr_str);
+                    rule.dst_port_start = p;
+                    rule.dst_port_end = p;
+                }
+            }
+        }
+
+        if (is_option_active(opt->direction)) {
+            rule.match_mask |= MATCH_DIRECTION;
+            if (strcasecmp(opt->direction, "ingress") == 0) rule.direction = 1;
+            else if (strcasecmp(opt->direction, "egress") == 0) rule.direction = 2;
+        }
+
+        if (is_option_active(opt->loopback)) {
+            rule.match_mask |= MATCH_LOOPBACK;
+            if (strcasecmp(opt->loopback, "yes") == 0) rule.loopback = 1;
+            else if (strcasecmp(opt->loopback, "no") == 0) rule.loopback = 0;
+        }
+
+        if (is_option_active(opt->ttl)) {
+            rule.match_mask |= MATCH_TTL;
+            rule.ttl = (uint8_t)atoi(opt->ttl);
+        }
+
+        if (is_option_active(opt->tcp_flags)) {
+            rule.match_mask |= MATCH_TCP_FLAGS;
+            rule.tcp_flags = parse_tcp_flags(opt->tcp_flags);
+            if (is_option_active(opt->tcp_flags_mask)) {
+                rule.tcp_flags_mask = parse_tcp_flags(opt->tcp_flags_mask);
+            } else {
+                rule.tcp_flags_mask = 0xFF;
+            }
+        }
+
+        rule.invert_mask = opt->invert_mask;
+
+        if (bpf_map_update_elem(map_fd_v6, &idx, &rule, BPF_ANY)) {
+            fprintf(stderr, "ERROR: updating filter_rules_ipv6 map failed: %s\n", strerror(errno));
+            close(map_fd);
+            close(map_fd_v6);
+            return -1;
+        }
+    }
+
+    close(map_fd);
+    close(map_fd_v6);
+    printf("Successfully added rule at index %d\n", idx);
     return 0;
 }
 
@@ -404,7 +868,7 @@ int ebpfdivert_rules_add(int idx, const char *proto, const char *ip_cidr, const 
         if (strcmp(ip_cidr, "any") != 0) {
             rule.match_mask |= MATCH_DST_IP;
             char ip_str[64];
-            strncpy(ip_str, ip_cidr, sizeof(ip_str));
+            snprintf(ip_str, sizeof(ip_str), "%s", ip_cidr);
             char *slash = strchr(ip_str, '/');
             int bits = 32;
             if (slash) {
@@ -434,7 +898,7 @@ int ebpfdivert_rules_add(int idx, const char *proto, const char *ip_cidr, const 
             rule.match_mask |= MATCH_DST_PORT;
             if (rule.proto == 1) {
                 char pr_str[32];
-                strncpy(pr_str, port_range, sizeof(pr_str));
+                snprintf(pr_str, sizeof(pr_str), "%s", port_range);
                 char *slash = strchr(pr_str, '/');
                 int type = atoi(pr_str);
                 int code = 0;
@@ -447,7 +911,7 @@ int ebpfdivert_rules_add(int idx, const char *proto, const char *ip_cidr, const 
                 rule.icmp_code_end = code;
             } else {
                 char pr_str[32];
-                strncpy(pr_str, port_range, sizeof(pr_str));
+                snprintf(pr_str, sizeof(pr_str), "%s", port_range);
                 char *dash = strchr(pr_str, '-');
                 if (dash) {
                     *dash = '\0';
@@ -485,7 +949,7 @@ int ebpfdivert_rules_add(int idx, const char *proto, const char *ip_cidr, const 
         if (strcmp(ip_cidr, "any") != 0) {
             rule.match_mask |= MATCH_DST_IP;
             char ip_str[128];
-            strncpy(ip_str, ip_cidr, sizeof(ip_str));
+            snprintf(ip_str, sizeof(ip_str), "%s", ip_cidr);
             char *slash = strchr(ip_str, '/');
             int bits = 128;
             if (slash) {
@@ -521,7 +985,7 @@ int ebpfdivert_rules_add(int idx, const char *proto, const char *ip_cidr, const 
             rule.match_mask |= MATCH_DST_PORT;
             if (rule.proto == 58) {
                 char pr_str[32];
-                strncpy(pr_str, port_range, sizeof(pr_str));
+                snprintf(pr_str, sizeof(pr_str), "%s", port_range);
                 char *slash = strchr(pr_str, '/');
                 int type = atoi(pr_str);
                 int code = 0;
@@ -534,7 +998,7 @@ int ebpfdivert_rules_add(int idx, const char *proto, const char *ip_cidr, const 
                 rule.icmp_code_end = code;
             } else {
                 char pr_str[32];
-                strncpy(pr_str, port_range, sizeof(pr_str));
+                snprintf(pr_str, sizeof(pr_str), "%s", port_range);
                 char *dash = strchr(pr_str, '-');
                 if (dash) {
                     *dash = '\0';
@@ -586,6 +1050,12 @@ int ebpfdivert_get_stats(uint64_t *stats, int stats_len) {
     return 0;
 }
 
+struct pkt_queue_entry {
+    struct divert_packet_buffer pkt;
+    size_t size;
+    struct pkt_queue_entry *next;
+};
+
 struct if_sock_entry {
     int ifindex;
     int sock;
@@ -602,6 +1072,9 @@ struct ebpfdivert_handle {
     size_t curr_buf_len;
     int curr_received;
 
+    struct pkt_queue_entry *queue_head;
+    struct pkt_queue_entry *queue_tail;
+
     // Cache of interface-specific raw sockets for TX ring injection
     struct if_sock_entry *socks;
     int socks_count;
@@ -612,13 +1085,26 @@ static int ebpfdivert_rb_callback(void *ctx, void *data, size_t size) {
     struct ebpfdivert_handle *h = ctx;
     if (!h) return 0;
     
-    if (h->curr_received) {
-        return -1;
+    if (!h->curr_received) {
+        size_t to_copy = (size < h->curr_buf_len) ? size : h->curr_buf_len;
+        memcpy(h->curr_buf, data, to_copy);
+        h->curr_received = 1;
+    } else {
+        struct pkt_queue_entry *entry = malloc(sizeof(struct pkt_queue_entry));
+        if (entry) {
+            size_t to_copy = (size < sizeof(struct divert_packet_buffer)) ? size : sizeof(struct divert_packet_buffer);
+            memcpy(&entry->pkt, data, to_copy);
+            entry->size = size;
+            entry->next = NULL;
+            if (h->queue_tail) {
+                h->queue_tail->next = entry;
+                h->queue_tail = entry;
+            } else {
+                h->queue_head = entry;
+                h->queue_tail = entry;
+            }
+        }
     }
-    
-    size_t to_copy = (size < h->curr_buf_len) ? size : h->curr_buf_len;
-    memcpy(h->curr_buf, data, to_copy);
-    h->curr_received = 1;
     return 0;
 }
 
@@ -628,6 +1114,8 @@ ebpfdivert_handle_t *ebpfdivert_open(uint32_t priority) {
     
     h->priority = priority;
     h->ringbuf_fd = -1;
+    h->queue_head = NULL;
+    h->queue_tail = NULL;
     
     h->ringbuf_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/pcap_ringbuf");
     if (h->ringbuf_fd < 0) {
@@ -659,6 +1147,18 @@ ebpfdivert_handle_t *ebpfdivert_open(uint32_t priority) {
 
 int ebpfdivert_recv(ebpfdivert_handle_t *h, struct divert_packet_buffer *buf, size_t buf_len, int timeout_ms) {
     if (!h || !buf) return -EINVAL;
+    
+    if (h->queue_head) {
+        struct pkt_queue_entry *entry = h->queue_head;
+        size_t to_copy = (entry->size < buf_len) ? entry->size : buf_len;
+        memcpy(buf, &entry->pkt, to_copy);
+        h->queue_head = entry->next;
+        if (!h->queue_head) {
+            h->queue_tail = NULL;
+        }
+        free(entry);
+        return 0;
+    }
     
     h->curr_buf = buf;
     h->curr_buf_len = buf_len;
@@ -764,6 +1264,15 @@ void ebpfdivert_close(ebpfdivert_handle_t *h) {
         close(h->socks[i].sock);
     }
     free(h->socks);
+    
+    // Free the packet queue
+    struct pkt_queue_entry *curr = h->queue_head;
+    while (curr) {
+        struct pkt_queue_entry *next = curr->next;
+        free(curr);
+        curr = next;
+    }
+    
     if (h->rb) {
         ring_buffer__free(h->rb);
     }

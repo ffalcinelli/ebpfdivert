@@ -140,7 +140,7 @@ int recv_udp_packet(int server_fd, char *buf, size_t buf_len) {
 // Extract UDP payload from a raw divert packet buffer
 const char *get_udp_payload(const struct divert_packet_buffer *buf, size_t *len) {
     uint16_t l2_len = buf->header.l2_len;
-    if (l2_len + 20 > buf->header.pkt_len) return NULL;
+    if ((uint32_t)(l2_len + 20) > buf->header.pkt_len) return NULL;
     
     const uint8_t *l3 = buf->data + l2_len;
     uint8_t ver = l3[0] >> 4;
@@ -152,7 +152,7 @@ const char *get_udp_payload(const struct divert_packet_buffer *buf, size_t *len)
         uint8_t proto = l3[9];
         if (proto != 17) return NULL; // Not UDP
         
-        if (l2_len + ip_header_len + 8 > buf->header.pkt_len) return NULL;
+        if ((uint32_t)(l2_len + ip_header_len + 8) > buf->header.pkt_len) return NULL;
         const uint8_t *udp = l3 + ip_header_len;
         uint16_t udp_len = ntohs(*(const uint16_t *)(udp + 4));
         if (udp_len < 8) return NULL;
@@ -162,7 +162,7 @@ const char *get_udp_payload(const struct divert_packet_buffer *buf, size_t *len)
         uint8_t proto = l3[6];
         if (proto != 17) return NULL; // Not UDP
         
-        if (l2_len + 40 + 8 > buf->header.pkt_len) return NULL;
+        if ((uint32_t)(l2_len + 40 + 8) > buf->header.pkt_len) return NULL;
         const uint8_t *udp = l3 + 40;
         uint16_t udp_len = ntohs(*(const uint16_t *)(udp + 4));
         if (udp_len < 8) return NULL;
@@ -299,10 +299,15 @@ void test_loopback_suite(void) {
     }
     printf("  [PASS] Receiver successfully received sniffed packet\n");
 
-    // User space should ALSO get it
+    // User space should ALSO get it (twice on loopback due to bidirectional matching)
     recv_ret = ebpfdivert_recv(h, &buf, sizeof(buf), 200);
     if (recv_ret != 0) {
-        printf("  [FAIL] User space failed to receive copy of sniffed packet\n");
+        printf("  [FAIL] User space failed to receive copy of sniffed packet (1)\n");
+        exit(1);
+    }
+    recv_ret = ebpfdivert_recv(h, &buf, sizeof(buf), 200);
+    if (recv_ret != 0) {
+        printf("  [FAIL] User space failed to receive copy of sniffed packet (2)\n");
         exit(1);
     }
     printf("  [PASS] User space successfully captured copy of sniffed packet\n");
@@ -340,6 +345,74 @@ void test_loopback_suite(void) {
         exit(1);
     }
     printf("  [PASS] Unmatched packet skipped by BPF engine\n");
+
+    close(srv);
+    close(cli);
+
+    // --- Case 5: Multiple packets back-to-back ---
+    printf("\nCase 5: Multiple packets back-to-back\n");
+    ebpfdivert_rules_clear();
+    ebpfdivert_rules_add(0, "udp", "any", "12345", "divert");
+    ebpfdivert_get_stats(stats_before, 5);
+
+    srv = create_udp_server("127.0.0.1", TEST_PORT, 0);
+    cli = create_udp_client("127.0.0.1", 0);
+    assert(srv >= 0 && cli >= 0);
+
+    const char *payload_multi1 = "loopback_multi_1";
+    const char *payload_multi2 = "loopback_multi_2";
+    send_udp_packet(cli, "127.0.0.1", TEST_PORT, payload_multi1, 0);
+    send_udp_packet(cli, "127.0.0.1", TEST_PORT, payload_multi2, 0);
+
+    // Both should be diverted, so receiver gets nothing
+    srv_ret = recv_udp_packet(srv, payload_buf, sizeof(payload_buf));
+    if (srv_ret >= 0) {
+        printf("  [FAIL] Receiver received packet that should be diverted/dropped (1)\n");
+        exit(1);
+    }
+    srv_ret = recv_udp_packet(srv, payload_buf, sizeof(payload_buf));
+    if (srv_ret >= 0) {
+        printf("  [FAIL] Receiver received packet that should be diverted/dropped (2)\n");
+        exit(1);
+    }
+    printf("  [PASS] Both packets correctly diverted (receiver got nothing)\n");
+
+    // Retrieve first packet from ebpfdivert ringbuffer
+    recv_ret = ebpfdivert_recv(h, &buf, sizeof(buf), 200);
+    if (recv_ret != 0) {
+        printf("  [FAIL] ebpfdivert_recv failed to retrieve first packet (ret: %d)\n", recv_ret);
+        exit(1);
+    }
+    payload_len = 0;
+    bpf_payload = get_udp_payload(&buf, &payload_len);
+    if (!bpf_payload || strncmp(bpf_payload, payload_multi1, payload_len) != 0) {
+        printf("  [FAIL] First retrieved packet payload mismatch (got '%s')\n", bpf_payload ? bpf_payload : "NULL");
+        exit(1);
+    }
+    printf("  [PASS] Successfully retrieved first packet from ringbuffer (payload matches)\n");
+
+    // Retrieve second packet from ebpfdivert ringbuffer
+    recv_ret = ebpfdivert_recv(h, &buf, sizeof(buf), 200);
+    if (recv_ret != 0) {
+        printf("  [FAIL] ebpfdivert_recv failed to retrieve second packet (ret: %d)\n", recv_ret);
+        exit(1);
+    }
+    payload_len = 0;
+    bpf_payload = get_udp_payload(&buf, &payload_len);
+    if (!bpf_payload || strncmp(bpf_payload, payload_multi2, payload_len) != 0) {
+        printf("  [FAIL] Second retrieved packet payload mismatch (got '%s')\n", bpf_payload ? bpf_payload : "NULL");
+        exit(1);
+    }
+    printf("  [PASS] Successfully retrieved second packet from ringbuffer (payload matches)\n");
+
+    ebpfdivert_get_stats(stats_after, 5);
+    // Since both were diverted, STAT_DIVERTED should be incremented by 2
+    if (stats_after[STAT_DIVERTED] == stats_before[STAT_DIVERTED] + 2) {
+        printf("  [PASS] Telemetry metric 'STAT_DIVERTED' incremented correctly by 2 (before: %lu, after: %lu)\n", stats_before[STAT_DIVERTED], stats_after[STAT_DIVERTED]);
+    } else {
+        printf("  [FAIL] Telemetry metric 'STAT_DIVERTED' did not increment by 2 (before: %lu, after: %lu)\n", stats_before[STAT_DIVERTED], stats_after[STAT_DIVERTED]);
+        exit(1);
+    }
 
     close(srv);
     close(cli);

@@ -16,6 +16,23 @@ int ebpfdivert_rules_list(void);
 int ebpfdivert_rules_add(int idx, const char *proto, const char *ip_cidr, const char *port_range, const char *action);
 int ebpfdivert_get_stats(uint64_t *stats, int stats_len);
 
+struct ebpfdivert_rule_opt {
+    const char *proto;
+    const char *src_ip_cidr;
+    const char *dst_ip_cidr;
+    const char *src_port_range;
+    const char *dst_port_range;
+    const char *action;
+    const char *direction;
+    const char *loopback;
+    const char *ttl;
+    const char *tcp_flags;
+    const char *tcp_flags_mask;
+    uint16_t invert_mask;
+};
+
+int ebpfdivert_rules_add_extended(int idx, const struct ebpfdivert_rule_opt *opt);
+
 struct ebpfdivert_handle;
 typedef struct ebpfdivert_handle ebpfdivert_handle_t;
 
