@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -19,12 +19,29 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev make gcc linux-headers-generic
 
-      - name: Build
-        run: make
+      - name: Build and Package
+        run: |
+          # Compile the project
+          make
+          
+          # Create a structured directory and install built files
+          tag_name="${GITHUB_REF##*/}"
+          DIST_DIR="ebpfdivert-${tag_name}-linux-amd64"
+          make install DESTDIR="$(pwd)/$DIST_DIR" PREFIX=""
+          
+          # Include README and LICENSE
+          cp README.md LICENSE "$DIST_DIR/" || true
+          
+          # Compress the release package
+          tar -czf "${DIST_DIR}.tar.gz" -C "$DIST_DIR" .
+          
+          # Export tarball filename for the next step
+          echo "TARBALL_NAME=${DIST_DIR}.tar.gz" >> $GITHUB_ENV
 
       - name: Create Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag_name="${GITHUB_REF##*/}"
-          gh release create "$tag_name" ebpfdivert.bpf.o --title "Release $tag_name" --notes "Automated release for $tag_name"
+          gh release create "$tag_name" ebpfdivert.bpf.o "$TARBALL_NAME" --title "Release $tag_name" --notes "Automated release for $tag_name"
+

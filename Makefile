@@ -34,3 +34,26 @@ $(TEST_INT_EXE): $(TEST_INT_SRC) $(LIB_SO)
 clean:
 	rm -f $(BPF_OBJ) $(TEST_EXE) $(LIB_SO) $(CLI_EXE) $(TEST_INT_EXE)
 
+PREFIX ?= /usr/local
+INSTALL ?= install
+
+.PHONY: all clean install uninstall
+
+install: all
+	$(INSTALL) -d $(DESTDIR)$(PREFIX)/bin
+	$(INSTALL) -d $(DESTDIR)$(PREFIX)/lib
+	$(INSTALL) -d $(DESTDIR)$(PREFIX)/include/ebpfdivert
+	$(INSTALL) -m 0755 $(CLI_EXE) $(DESTDIR)$(PREFIX)/bin/
+	$(INSTALL) -m 0755 $(LIB_SO) $(DESTDIR)$(PREFIX)/lib/
+	$(INSTALL) -m 0644 include/ebpfdivert.h $(DESTDIR)$(PREFIX)/include/ebpfdivert/
+	$(INSTALL) -m 0644 include/ebpfdivert_shared.h $(DESTDIR)$(PREFIX)/include/ebpfdivert/
+	$(INSTALL) -d $(DESTDIR)$(PREFIX)/lib/ebpfdivert
+	$(INSTALL) -m 0644 $(BPF_OBJ) $(DESTDIR)$(PREFIX)/lib/ebpfdivert/
+
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/$(CLI_EXE)
+	rm -f $(DESTDIR)$(PREFIX)/lib/$(LIB_SO)
+	rm -rf $(DESTDIR)$(PREFIX)/include/ebpfdivert
+	rm -rf $(DESTDIR)$(PREFIX)/lib/ebpfdivert
+
+
