@@ -45,6 +45,7 @@ typedef struct ebpfdivert_handle ebpfdivert_handle_t;
 ebpfdivert_handle_t *ebpfdivert_open(uint32_t priority);
 int ebpfdivert_recv(ebpfdivert_handle_t *h, struct divert_packet_buffer *buf, size_t buf_len, int timeout_ms);
 int ebpfdivert_send(ebpfdivert_handle_t *h, const struct divert_packet_buffer *buf);
+int ebpfdivert_set_max_queue_size(ebpfdivert_handle_t *h, int size);
 void ebpfdivert_close(ebpfdivert_handle_t *h);
 
 #ifdef __cplusplus

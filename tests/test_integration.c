@@ -201,13 +201,13 @@ void test_loopback_suite(void) {
 
     struct divert_packet_buffer buf;
     char payload_buf[256];
-    uint64_t stats_before[5] = {0}, stats_after[5] = {0};
+    uint64_t stats_before[6] = {0}, stats_after[6] = {0};
 
     // --- Case 1: Divert & Drop ---
     printf("\nCase 1: Divert & Drop (IPv4)\n");
     ebpfdivert_rules_clear();
     ebpfdivert_rules_add(0, "udp", "any", "12345", "divert");
-    ebpfdivert_get_stats(stats_before, 5);
+    ebpfdivert_get_stats(stats_before, 6);
 
     int srv = create_udp_server("127.0.0.1", TEST_PORT, 0);
     int cli = create_udp_client("127.0.0.1", 0);
@@ -238,7 +238,7 @@ void test_loopback_suite(void) {
     }
     printf("  [PASS] Successfully retrieved diverted packet from ringbuffer (payload matches)\n");
 
-    ebpfdivert_get_stats(stats_after, 5);
+    ebpfdivert_get_stats(stats_after, 6);
     verify_stats_incremented(stats_before, stats_after, STAT_DIVERTED, "STAT_DIVERTED");
 
     close(srv);
@@ -248,7 +248,7 @@ void test_loopback_suite(void) {
     printf("\nCase 2: Drop Rule\n");
     ebpfdivert_rules_clear();
     ebpfdivert_rules_add(0, "udp", "any", "12345", "drop");
-    ebpfdivert_get_stats(stats_before, 5);
+    ebpfdivert_get_stats(stats_before, 6);
 
     srv = create_udp_server("127.0.0.1", TEST_PORT, 0);
     cli = create_udp_client("127.0.0.1", 0);
@@ -272,7 +272,7 @@ void test_loopback_suite(void) {
     }
     printf("  [PASS] Packet matching Drop rule was dropped silently\n");
 
-    ebpfdivert_get_stats(stats_after, 5);
+    ebpfdivert_get_stats(stats_after, 6);
     verify_stats_incremented(stats_before, stats_after, STAT_DROPPED, "STAT_DROPPED");
 
     close(srv);
@@ -282,7 +282,7 @@ void test_loopback_suite(void) {
     printf("\nCase 3: Sniff Rule\n");
     ebpfdivert_rules_clear();
     ebpfdivert_rules_add(0, "udp", "any", "12345", "sniff");
-    ebpfdivert_get_stats(stats_before, 5);
+    ebpfdivert_get_stats(stats_before, 6);
 
     srv = create_udp_server("127.0.0.1", TEST_PORT, 0);
     cli = create_udp_client("127.0.0.1", 0);
@@ -312,7 +312,7 @@ void test_loopback_suite(void) {
     }
     printf("  [PASS] User space successfully captured copy of sniffed packet\n");
 
-    ebpfdivert_get_stats(stats_after, 5);
+    ebpfdivert_get_stats(stats_after, 6);
     verify_stats_incremented(stats_before, stats_after, STAT_SNIFFED, "STAT_SNIFFED");
 
     close(srv);
@@ -353,7 +353,7 @@ void test_loopback_suite(void) {
     printf("\nCase 5: Multiple packets back-to-back\n");
     ebpfdivert_rules_clear();
     ebpfdivert_rules_add(0, "udp", "any", "12345", "divert");
-    ebpfdivert_get_stats(stats_before, 5);
+    ebpfdivert_get_stats(stats_before, 6);
 
     srv = create_udp_server("127.0.0.1", TEST_PORT, 0);
     cli = create_udp_client("127.0.0.1", 0);
@@ -405,7 +405,7 @@ void test_loopback_suite(void) {
     }
     printf("  [PASS] Successfully retrieved second packet from ringbuffer (payload matches)\n");
 
-    ebpfdivert_get_stats(stats_after, 5);
+    ebpfdivert_get_stats(stats_after, 6);
     // Since both were diverted, STAT_DIVERTED should be incremented by 2
     if (stats_after[STAT_DIVERTED] == stats_before[STAT_DIVERTED] + 2) {
         printf("  [PASS] Telemetry metric 'STAT_DIVERTED' incremented correctly by 2 (before: %lu, after: %lu)\n", stats_before[STAT_DIVERTED], stats_after[STAT_DIVERTED]);
@@ -413,6 +413,61 @@ void test_loopback_suite(void) {
         printf("  [FAIL] Telemetry metric 'STAT_DIVERTED' did not increment by 2 (before: %lu, after: %lu)\n", stats_before[STAT_DIVERTED], stats_after[STAT_DIVERTED]);
         exit(1);
     }
+
+    close(srv);
+    close(cli);
+
+    // --- Case 6: Active Backpressure ---
+    printf("\nCase 6: Active Backpressure\n");
+    ebpfdivert_rules_clear();
+    ebpfdivert_rules_add(0, "udp", "any", "12345", "divert");
+    ebpfdivert_get_stats(stats_before, 6);
+
+    // Limit queue size to 2
+    ebpfdivert_set_max_queue_size(h, 2);
+
+    srv = create_udp_server("127.0.0.1", TEST_PORT, 0);
+    cli = create_udp_client("127.0.0.1", 0);
+    assert(srv >= 0 && cli >= 0);
+
+    const char *payload_bp1 = "bp_pkt_1";
+    const char *payload_bp2 = "bp_pkt_2";
+    const char *payload_bp3 = "bp_pkt_3";
+    const char *payload_bp4 = "bp_pkt_4";
+
+    send_udp_packet(cli, "127.0.0.1", TEST_PORT, payload_bp1, 0);
+    send_udp_packet(cli, "127.0.0.1", TEST_PORT, payload_bp2, 0);
+    send_udp_packet(cli, "127.0.0.1", TEST_PORT, payload_bp3, 0);
+    send_udp_packet(cli, "127.0.0.1", TEST_PORT, payload_bp4, 0);
+    usleep(50000); // Wait for BPF to process
+
+    // Call recv to trigger polling
+    recv_ret = ebpfdivert_recv(h, &buf, sizeof(buf), 100);
+    if (recv_ret != 0) {
+        printf("  [FAIL] Failed to receive first backpressure packet (ret: %d)\n", recv_ret);
+        exit(1);
+    }
+    
+    // We should receive 1, and 2 and 3 should be in queue. 4 should be dropped.
+    ebpfdivert_get_stats(stats_after, 6);
+    verify_stats_incremented(stats_before, stats_after, STAT_QUEUE_FULL, "STAT_QUEUE_FULL");
+
+    // Pop the rest from queue
+    recv_ret = ebpfdivert_recv(h, &buf, sizeof(buf), 100); // returns 2
+    assert(recv_ret == 0);
+    recv_ret = ebpfdivert_recv(h, &buf, sizeof(buf), 100); // returns 3
+    assert(recv_ret == 0);
+    
+    // Queue should now be empty. Trying to receive again should timeout.
+    recv_ret = ebpfdivert_recv(h, &buf, sizeof(buf), 100);
+    if (recv_ret == 0) {
+        printf("  [FAIL] Received 4th packet which should have been dropped due to queue limit\n");
+        exit(1);
+    }
+    printf("  [PASS] Queue bounds enforced: 4th packet successfully dropped and telemetried\n");
+
+    // Restore max queue size
+    ebpfdivert_set_max_queue_size(h, 1024);
 
     close(srv);
     close(cli);
@@ -453,13 +508,13 @@ void test_veth_suite(const char *veth0) {
     }
 
     struct divert_packet_buffer buf;
-    uint64_t stats_before[5] = {0}, stats_after[5] = {0};
+    uint64_t stats_before[6] = {0}, stats_after[6] = {0};
 
     // --- Case 1: Egress Divert & Reinject (external link) ---
     printf("\nCase 1: Egress Divert & Reinject\n");
     ebpfdivert_rules_clear();
     ebpfdivert_rules_add(0, "udp", "10.200.1.2/32", "12345", "divert");
-    ebpfdivert_get_stats(stats_before, 5);
+    ebpfdivert_get_stats(stats_before, 6);
 
     const char *payload1 = "veth_egress_reinject";
     const char *rx_file = "/tmp/veth_rx.txt";
@@ -515,7 +570,7 @@ void test_veth_suite(const char *veth0) {
     }
     printf("  [PASS] Egress packet reinjected successfully and received by netns server\n");
 
-    ebpfdivert_get_stats(stats_after, 5);
+    ebpfdivert_get_stats(stats_after, 6);
     verify_stats_incremented(stats_before, stats_after, STAT_DIVERTED, "STAT_DIVERTED");
 
     close(cli);
@@ -524,7 +579,7 @@ void test_veth_suite(const char *veth0) {
     printf("\nCase 2: Drop Rule on Egress\n");
     ebpfdivert_rules_clear();
     ebpfdivert_rules_add(0, "udp", "10.200.1.2/32", "12345", "drop");
-    ebpfdivert_get_stats(stats_before, 5);
+    ebpfdivert_get_stats(stats_before, 6);
 
     const char *payload2 = "veth_egress_drop";
     unlink(rx_file);
@@ -550,7 +605,7 @@ void test_veth_suite(const char *veth0) {
     }
     printf("  [PASS] Packet dropped on egress successfully (server helper timed out)\n");
 
-    ebpfdivert_get_stats(stats_after, 5);
+    ebpfdivert_get_stats(stats_after, 6);
     verify_stats_incremented(stats_before, stats_after, STAT_DROPPED, "STAT_DROPPED");
 
     close(cli);
@@ -559,7 +614,7 @@ void test_veth_suite(const char *veth0) {
     printf("\nCase 3: Sniff Rule on Egress\n");
     ebpfdivert_rules_clear();
     ebpfdivert_rules_add(0, "udp", "10.200.1.2/32", "12345", "sniff");
-    ebpfdivert_get_stats(stats_before, 5);
+    ebpfdivert_get_stats(stats_before, 6);
 
     const char *payload3 = "veth_egress_sniff";
     unlink(rx_file);
@@ -593,10 +648,80 @@ void test_veth_suite(const char *veth0) {
     }
     printf("  [PASS] User space successfully sniffed packet copy\n");
 
-    ebpfdivert_get_stats(stats_after, 5);
+    ebpfdivert_get_stats(stats_after, 6);
     verify_stats_incremented(stats_before, stats_after, STAT_SNIFFED, "STAT_SNIFFED");
 
     close(cli);
+
+    // --- Case 4: Ingress Divert & Redirect Reinject ---
+    printf("\nCase 4: Ingress Divert & Redirect Reinject\n");
+    ebpfdivert_rules_clear();
+    struct ebpfdivert_rule_opt opt = {
+        .proto = "udp",
+        .dst_port_range = "12345",
+        .direction = "ingress",
+        .action = "divert"
+    };
+    ebpfdivert_rules_add_extended(0, &opt);
+    ebpfdivert_get_stats(stats_before, 6);
+
+    const char *payload4 = "veth_ingress_redirect";
+
+    int host_srv = create_udp_server("10.200.1.1", TEST_PORT, 0);
+    assert(host_srv >= 0);
+
+    pid_t ns_cli_pid = fork();
+    if (ns_cli_pid == 0) {
+        char port_str[16];
+        snprintf(port_str, sizeof(port_str), "%d", TEST_PORT);
+        execlp("ip", "ip", "netns", "exec", "ns1", "./test_integration", "client", "10.200.1.1", port_str, payload4, "10.200.1.2", NULL);
+        perror("execlp ip netns exec client");
+        exit(1);
+    }
+
+    recv_ret = ebpfdivert_recv(h, &buf, sizeof(buf), 500);
+    if (recv_ret != 0) {
+        printf("  [FAIL] ebpfdivert_recv failed to capture ingress packet (ret: %d)\n", recv_ret);
+        kill(ns_cli_pid, SIGKILL);
+        close(host_srv);
+        exit(1);
+    }
+
+    payload_len = 0;
+    bpf_payload = get_udp_payload(&buf, &payload_len);
+    if (!bpf_payload || strncmp(bpf_payload, payload4, payload_len) != 0) {
+        printf("  [FAIL] Ingress payload mismatch (got '%s')\n", bpf_payload ? bpf_payload : "NULL");
+        kill(ns_cli_pid, SIGKILL);
+        close(host_srv);
+        exit(1);
+    }
+    printf("  [PASS] Successfully captured ingress packet in user-space\n");
+
+    send_ret = ebpfdivert_send(h, &buf);
+    if (send_ret != 0) {
+        printf("  [FAIL] ebpfdivert_send failed to reinject ingress packet (ret: %d)\n", send_ret);
+        kill(ns_cli_pid, SIGKILL);
+        close(host_srv);
+        exit(1);
+    }
+
+    char host_rx_buf[256];
+    int host_rx_len = recv_udp_packet(host_srv, host_rx_buf, sizeof(host_rx_buf));
+    if (host_rx_len < 0 || strcmp(host_rx_buf, payload4) != 0) {
+        printf("  [FAIL] Host server did not receive the redirected ingress packet (ret: %d, got '%s')\n", host_rx_len, host_rx_buf);
+        kill(ns_cli_pid, SIGKILL);
+        close(host_srv);
+        exit(1);
+    }
+    printf("  [PASS] Host server successfully received redirected ingress packet!\n");
+
+    int ns_cli_status;
+    waitpid(ns_cli_pid, &ns_cli_status, 0);
+
+    ebpfdivert_get_stats(stats_after, 6);
+    verify_stats_incremented(stats_before, stats_after, STAT_DIVERTED, "STAT_DIVERTED");
+
+    close(host_srv);
 
     // Teardown
     ebpfdivert_close(h);
@@ -631,9 +756,22 @@ int run_server(const char *ip_str, uint16_t port, const char *expected_payload, 
     return 0;
 }
 
+int run_client(const char *dest_ip, uint16_t port, const char *payload, const char *bind_ip) {
+    int fd = create_udp_client(bind_ip, 0);
+    if (fd < 0) return 1;
+    int ret = send_udp_packet(fd, dest_ip, port, payload, 0);
+    close(fd);
+    return ret >= 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 6 && strcmp(argv[1], "server") == 0) {
         return run_server(argv[2], atoi(argv[3]), argv[4], argv[5]);
+    }
+    
+    if (argc >= 5 && strcmp(argv[1], "client") == 0) {
+        const char *bind_ip = (argc >= 6) ? argv[5] : NULL;
+        return run_client(argv[2], atoi(argv[3]), argv[4], bind_ip);
     }
     
     if (argc >= 3 && strcmp(argv[1], "lo") == 0) {

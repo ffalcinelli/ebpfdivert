@@ -30,7 +30,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 5);
+    __uint(max_entries, 6);
     __type(key, __u32);
     __type(value, __u64);
 } stats_map SEC(".maps");
@@ -345,6 +345,10 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
         if (my_prio <= inject_prio) return TC_ACT_UNSPEC;
     }
 
+    if ((skb->mark & 0xFFFF0000) == REDIRECT_MARK_MASK) {
+        return TC_ACT_UNSPEC;
+    }
+
     __u32 pull_len = skb->len;
     if (pull_len > 128) {
         pull_len = 128;
@@ -434,6 +438,13 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
 
 SEC("classifier")
 int tc_divert_ingress(struct __sk_buff *skb) {
+    if ((skb->mark & 0xFFFF0000) == REDIRECT_MARK_MASK) {
+        __u32 target_ifindex = skb->mark & 0xFFFF;
+        if (skb->ifindex == target_ifindex) {
+            return TC_ACT_UNSPEC;
+        }
+        return bpf_redirect(target_ifindex, BPF_F_INGRESS);
+    }
     return process_packet(skb, 1);
 }
 

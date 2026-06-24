@@ -24,8 +24,8 @@ void print_usage(const char *prog_name) {
 }
 
 int cli_stats() {
-    uint64_t stats[5] = {0};
-    if (ebpfdivert_get_stats(stats, 5)) {
+    uint64_t stats[6] = {0};
+    if (ebpfdivert_get_stats(stats, 6)) {
         fprintf(stderr, "ERROR: eBPFDivert stats map not found. Is the driver loaded?\n");
         return -1;
     }
@@ -35,13 +35,14 @@ int cli_stats() {
         "Dropped",
         "Sniffed",
         "Parsing Errors",
-        "Ringbuf Full"
+        "Ringbuf Full",
+        "Queue Full"
     };
 
     printf("eBPFDivert Statistics:\n");
     printf("Metric          | Value\n");
     printf("---------------------------\n");
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         printf("%-15s | %lu\n", stat_names[i], stats[i]);
     }
     return 0;

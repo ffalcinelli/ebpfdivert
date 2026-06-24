@@ -188,6 +188,12 @@ int ebpfdivert_load(const char *ifname, const char *obj_path, uint32_t priority)
         printf("Successfully loaded and attached eBPFDivert to '%s' (Ingress & Egress)\n", ifname);
     }
 
+    // Always attach to loopback interface 'lo' to enable BPF-level redirect injection
+    int lo_idx = if_nametoindex("lo");
+    if (lo_idx > 0 && lo_idx != ifindex) {
+        attach_tc_hooks(lo_idx, prog_ingress, prog_egress);
+    }
+
     bpf_object__close(obj);
     return 0;
 }
@@ -221,6 +227,11 @@ int ebpfdivert_unload(const char *ifname) {
             return -1;
         }
         detach_tc_hooks(ifindex);
+        // Also detach lo if it was attached
+        int lo_idx = if_nametoindex("lo");
+        if (lo_idx > 0 && lo_idx != ifindex) {
+            detach_tc_hooks(lo_idx);
+        }
         cleanup_pinned_resources();
         printf("Successfully unloaded and detached eBPFDivert from '%s'\n", ifname);
     }
@@ -1035,7 +1046,7 @@ int ebpfdivert_get_stats(uint64_t *stats, int stats_len) {
     int num_cpus = libbpf_num_possible_cpus();
     __u64 values[num_cpus];
 
-    for (__u32 key = 0; key < 5 && key < (__u32)stats_len; key++) {
+    for (__u32 key = 0; key < (__u32)stats_len; key++) {
         memset(values, 0, sizeof(values));
         uint64_t total = 0;
         if (bpf_map_lookup_elem(stats_fd, &key, values) == 0) {
@@ -1057,7 +1068,9 @@ struct pkt_queue_entry {
 };
 
 struct if_sock_entry {
-    int ifindex;
+    int ifindex;        // The interface bound to (lo or target)
+    int target_ifindex; // Destination target interface
+    int is_redirect;    // Flag indicating this is a redirect injection socket
     int sock;
     uint8_t *tx_ring;
     uint32_t tx_index;
@@ -1074,6 +1087,8 @@ struct ebpfdivert_handle {
 
     struct pkt_queue_entry *queue_head;
     struct pkt_queue_entry *queue_tail;
+    int queue_size;
+    int max_queue_size;
 
     // Cache of interface-specific raw sockets for TX ring injection
     struct if_sock_entry *socks;
@@ -1090,6 +1105,21 @@ static int ebpfdivert_rb_callback(void *ctx, void *data, size_t size) {
         memcpy(h->curr_buf, data, to_copy);
         h->curr_received = 1;
     } else {
+        if (h->queue_size >= h->max_queue_size) {
+            int stats_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/stats_map");
+            if (stats_fd >= 0) {
+                __u32 key = STAT_QUEUE_FULL;
+                int num_cpus = libbpf_num_possible_cpus();
+                __u64 values[num_cpus];
+                memset(values, 0, sizeof(values));
+                if (bpf_map_lookup_elem(stats_fd, &key, values) == 0) {
+                    values[0] += 1;
+                    bpf_map_update_elem(stats_fd, &key, values, BPF_ANY);
+                }
+                close(stats_fd);
+            }
+            return 0; // Drop packet (backpressure)
+        }
         struct pkt_queue_entry *entry = malloc(sizeof(struct pkt_queue_entry));
         if (entry) {
             size_t to_copy = (size < sizeof(struct divert_packet_buffer)) ? size : sizeof(struct divert_packet_buffer);
@@ -1103,6 +1133,7 @@ static int ebpfdivert_rb_callback(void *ctx, void *data, size_t size) {
                 h->queue_head = entry;
                 h->queue_tail = entry;
             }
+            h->queue_size++;
         }
     }
     return 0;
@@ -1116,6 +1147,8 @@ ebpfdivert_handle_t *ebpfdivert_open(uint32_t priority) {
     h->ringbuf_fd = -1;
     h->queue_head = NULL;
     h->queue_tail = NULL;
+    h->queue_size = 0;
+    h->max_queue_size = 1024; // Default max queue size
     
     h->ringbuf_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/pcap_ringbuf");
     if (h->ringbuf_fd < 0) {
@@ -1156,6 +1189,7 @@ int ebpfdivert_recv(ebpfdivert_handle_t *h, struct divert_packet_buffer *buf, si
         if (!h->queue_head) {
             h->queue_tail = NULL;
         }
+        h->queue_size--;
         free(entry);
         return 0;
     }
@@ -1197,9 +1231,21 @@ int ebpfdivert_send(ebpfdivert_handle_t *h, const struct divert_packet_buffer *b
         to_send = 2048;
     }
     
+    int is_redirect = (buf->header.direction == 1);
+    int target_ifindex = ifindex;
+    int lo_idx = if_nametoindex("lo");
+    if (lo_idx <= 0) lo_idx = 1;
+    
+    int bind_ifindex = is_redirect ? lo_idx : target_ifindex;
+    if (target_ifindex == lo_idx) {
+        is_redirect = 0;
+        bind_ifindex = lo_idx;
+    }
+    
     int sock_idx = -1;
     for (int i = 0; i < h->socks_count; i++) {
-        if (h->socks[i].ifindex == ifindex) {
+        if (h->socks[i].is_redirect == is_redirect && 
+            h->socks[i].target_ifindex == target_ifindex) {
             sock_idx = i;
             break;
         }
@@ -1221,7 +1267,13 @@ int ebpfdivert_send(ebpfdivert_handle_t *h, const struct divert_packet_buffer *b
             return -errno;
         }
         
-        uint32_t mark = 0x4D490000 | (h->priority & 0xFFFF);
+        uint32_t mark;
+        if (is_redirect) {
+            mark = REDIRECT_MARK_MASK | (target_ifindex & 0xFFFF);
+        } else {
+            mark = 0x4D490000 | (h->priority & 0xFFFF);
+        }
+        
         if (setsockopt(sock, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) < 0) {
             close(sock);
             return -errno;
@@ -1230,16 +1282,17 @@ int ebpfdivert_send(ebpfdivert_handle_t *h, const struct divert_packet_buffer *b
         struct sockaddr_ll sll;
         memset(&sll, 0, sizeof(sll));
         sll.sll_family = AF_PACKET;
-        sll.sll_ifindex = ifindex;
+        sll.sll_ifindex = bind_ifindex;
         sll.sll_protocol = htons(ETH_P_ALL);
         if (bind(sock, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
             close(sock);
             return -errno;
         }
         
-
         sock_idx = h->socks_count;
-        h->socks[sock_idx].ifindex = ifindex;
+        h->socks[sock_idx].ifindex = bind_ifindex;
+        h->socks[sock_idx].target_ifindex = target_ifindex;
+        h->socks[sock_idx].is_redirect = is_redirect;
         h->socks[sock_idx].sock = sock;
         h->socks[sock_idx].tx_ring = NULL;
         h->socks[sock_idx].tx_index = 0;
@@ -1252,6 +1305,12 @@ int ebpfdivert_send(ebpfdivert_handle_t *h, const struct divert_packet_buffer *b
         return -errno;
     }
     
+    return 0;
+}
+
+int ebpfdivert_set_max_queue_size(ebpfdivert_handle_t *h, int size) {
+    if (!h || size <= 0) return -EINVAL;
+    h->max_queue_size = size;
     return 0;
 }
 

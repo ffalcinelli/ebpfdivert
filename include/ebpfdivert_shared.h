@@ -15,6 +15,9 @@
 #define STAT_SNIFFED      2
 #define STAT_PARSING_ERR  3
 #define STAT_RINGBUF_FULL 4
+#define STAT_QUEUE_FULL   5
+
+#define REDIRECT_MARK_MASK 0x4D4A0000
 
 #define MATCH_SRC_IP         (1 << 0)
 #define MATCH_DST_IP         (1 << 1)
