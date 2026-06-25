@@ -561,7 +561,9 @@ void test_veth_suite(const char *veth0) {
     FILE *f = fopen(rx_file, "r");
     char result_buf[256] = {0};
     if (f) {
-        fgets(result_buf, sizeof(result_buf), f);
+        if (!fgets(result_buf, sizeof(result_buf), f)) {
+            result_buf[0] = '\0';
+        }
         fclose(f);
     }
     if (strcmp(result_buf, "SUCCESS") != 0) {
@@ -596,7 +598,9 @@ void test_veth_suite(const char *veth0) {
     f = fopen(rx_file, "r");
     result_buf[0] = '\0';
     if (f) {
-        fgets(result_buf, sizeof(result_buf), f);
+        if (!fgets(result_buf, sizeof(result_buf), f)) {
+            result_buf[0] = '\0';
+        }
         fclose(f);
     }
     if (strncmp(result_buf, "FAIL", 4) != 0) {
@@ -631,7 +635,9 @@ void test_veth_suite(const char *veth0) {
     f = fopen(rx_file, "r");
     result_buf[0] = '\0';
     if (f) {
-        fgets(result_buf, sizeof(result_buf), f);
+        if (!fgets(result_buf, sizeof(result_buf), f)) {
+            result_buf[0] = '\0';
+        }
         fclose(f);
     }
     if (strcmp(result_buf, "SUCCESS") != 0) {
