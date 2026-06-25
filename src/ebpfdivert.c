@@ -20,6 +20,36 @@
 
 #include <stdarg.h>
 
+static ebpfdivert_print_fn_t ebpfdivert_user_print_fn = NULL;
+
+void ebpfdivert_set_print(ebpfdivert_print_fn_t print_fn) {
+    ebpfdivert_user_print_fn = print_fn;
+}
+
+static int default_print_fn(enum ebpfdivert_print_level level, const char *format, va_list args) {
+    if (level <= EBPFDIVERT_WARN) {
+        return vfprintf(stderr, format, args);
+    }
+    return 0;
+}
+
+static int pr_log(enum ebpfdivert_print_level level, const char *format, ...) {
+    va_list args;
+    int err;
+    va_start(args, format);
+    if (ebpfdivert_user_print_fn) {
+        err = ebpfdivert_user_print_fn(level, format, args);
+    } else {
+        err = default_print_fn(level, format, args);
+    }
+    va_end(args);
+    return err;
+}
+
+#define pr_err(fmt, ...)  pr_log(EBPFDIVERT_ERROR, fmt, ##__VA_ARGS__)
+#define pr_warn(fmt, ...) pr_log(EBPFDIVERT_WARN, fmt, ##__VA_ARGS__)
+#define pr_info(fmt, ...) pr_log(EBPFDIVERT_INFO, fmt, ##__VA_ARGS__)
+
 static int ebpfdivert_libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
     char buf[512];
     va_list args_copy;
@@ -34,10 +64,19 @@ static int ebpfdivert_libbpf_print_fn(enum libbpf_print_level level, const char 
         strstr(buf, "Kernel error message") != NULL) {
         return 0;
     }
-    if (level <= LIBBPF_WARN) {
-        return vfprintf(stderr, format, args);
+    
+    enum ebpfdivert_print_level u_level = EBPFDIVERT_INFO;
+    if (level == LIBBPF_WARN) {
+        u_level = EBPFDIVERT_WARN;
+    } else if (level == LIBBPF_DEBUG) {
+        u_level = EBPFDIVERT_DEBUG;
     }
-    return 0;
+    
+    if (ebpfdivert_user_print_fn) {
+        return ebpfdivert_user_print_fn(u_level, format, args);
+    } else {
+        return default_print_fn(u_level, format, args);
+    }
 }
 
 static void cleanup_pinned_resources(void) {
@@ -64,7 +103,7 @@ static int attach_tc_hooks(int ifindex, struct bpf_program *prog_ingress, struct
 
     int err = bpf_tc_attach(&hook_ingress, &opts_ingress);
     if (err && err != -EEXIST) {
-        fprintf(stderr, "ERROR: attaching ingress program to ifindex %d failed: %s\n", ifindex, strerror(-err));
+        pr_err("ERROR: attaching ingress program to ifindex %d failed: %s\n", ifindex, strerror(-err));
         bpf_tc_hook_destroy(&hook_ingress);
         return -1;
     }
@@ -82,7 +121,7 @@ static int attach_tc_hooks(int ifindex, struct bpf_program *prog_ingress, struct
 
     err = bpf_tc_attach(&hook_egress, &opts_egress);
     if (err && err != -EEXIST) {
-        fprintf(stderr, "ERROR: attaching egress program to ifindex %d failed: %s\n", ifindex, strerror(-err));
+        pr_err("ERROR: attaching egress program to ifindex %d failed: %s\n", ifindex, strerror(-err));
         DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook_ingress_del,
             .ifindex = ifindex,
             .attach_point = BPF_TC_INGRESS
@@ -119,19 +158,19 @@ int ebpfdivert_load(const char *ifname, const char *obj_path, uint32_t priority)
     if (!attach_all) {
         ifindex = if_nametoindex(ifname);
         if (ifindex == 0) {
-            fprintf(stderr, "ERROR: interface '%s' not found\n", ifname);
+            pr_err("ERROR: interface '%s' not found\n", ifname);
             return -1;
         }
     }
 
     struct bpf_object *obj = bpf_object__open_file(obj_path, NULL);
     if (!obj) {
-        fprintf(stderr, "ERROR: opening BPF object file '%s' failed\n", obj_path);
+        pr_err("ERROR: opening BPF object file '%s' failed\n", obj_path);
         return -1;
     }
 
     if (bpf_object__load(obj)) {
-        fprintf(stderr, "ERROR: loading BPF object file failed\n");
+        pr_err("ERROR: loading BPF object file failed\n");
         bpf_object__close(obj);
         return -1;
     }
@@ -146,7 +185,7 @@ int ebpfdivert_load(const char *ifname, const char *obj_path, uint32_t priority)
             snprintf(pin_path, sizeof(pin_path), "/sys/fs/bpf/ebpfdivert/%s", map_names[i]);
             unlink(pin_path);
             if (bpf_map__pin(map, pin_path)) {
-                fprintf(stderr, "WARNING: pinning map '%s' failed: %s\n", map_names[i], strerror(errno));
+                pr_warn("WARNING: pinning map '%s' failed: %s\n", map_names[i], strerror(errno));
             }
         }
     }
@@ -162,7 +201,7 @@ int ebpfdivert_load(const char *ifname, const char *obj_path, uint32_t priority)
         int map_fd = bpf_map__fd(config_map);
         if (map_fd >= 0) {
             if (bpf_map_update_elem(map_fd, &key, &config, BPF_ANY)) {
-                fprintf(stderr, "WARNING: setting config in config_map failed: %s\n", strerror(errno));
+                pr_warn("WARNING: setting config in config_map failed: %s\n", strerror(errno));
             }
         }
     }
@@ -170,7 +209,7 @@ int ebpfdivert_load(const char *ifname, const char *obj_path, uint32_t priority)
     struct bpf_program *prog_ingress = bpf_object__find_program_by_name(obj, "tc_divert_ingress");
     struct bpf_program *prog_egress = bpf_object__find_program_by_name(obj, "tc_divert_egress");
     if (!prog_ingress || !prog_egress) {
-        fprintf(stderr, "ERROR: programs not found in object file\n");
+        pr_err("ERROR: programs not found in object file\n");
         cleanup_pinned_resources();
         bpf_object__close(obj);
         return -1;
@@ -180,7 +219,7 @@ int ebpfdivert_load(const char *ifname, const char *obj_path, uint32_t priority)
     if (attach_all) {
         struct ifaddrs *ifaddr, *ifa;
         if (getifaddrs(&ifaddr) == -1) {
-            fprintf(stderr, "ERROR: getifaddrs failed: %s\n", strerror(errno));
+            pr_err("ERROR: getifaddrs failed: %s\n", strerror(errno));
             cleanup_pinned_resources();
             bpf_object__close(obj);
             return -1;
@@ -203,19 +242,19 @@ int ebpfdivert_load(const char *ifname, const char *obj_path, uint32_t priority)
         }
         freeifaddrs(ifaddr);
         if (attached_count == 0) {
-            fprintf(stderr, "ERROR: no active network interfaces found to attach to\n");
+            pr_err("ERROR: no active network interfaces found to attach to\n");
             cleanup_pinned_resources();
             bpf_object__close(obj);
             return -1;
         }
-        printf("Successfully loaded and attached eBPFDivert to %d interfaces (Ingress & Egress)\n", attached_count);
+        pr_info("Successfully loaded and attached eBPFDivert to %d interfaces (Ingress & Egress)\n", attached_count);
     } else {
         if (attach_tc_hooks(ifindex, prog_ingress, prog_egress) != 0) {
             cleanup_pinned_resources();
             bpf_object__close(obj);
             return -1;
         }
-        printf("Successfully loaded and attached eBPFDivert to '%s' (Ingress & Egress)\n", ifname);
+        pr_info("Successfully loaded and attached eBPFDivert to '%s' (Ingress & Egress)\n", ifname);
     }
 
     // Always attach to loopback interface 'lo' to enable BPF-level redirect injection
@@ -235,7 +274,7 @@ int ebpfdivert_unload(const char *ifname) {
     if (detach_all) {
         struct ifaddrs *ifaddr, *ifa;
         if (getifaddrs(&ifaddr) == -1) {
-            fprintf(stderr, "ERROR: getifaddrs failed: %s\n", strerror(errno));
+            pr_err("ERROR: getifaddrs failed: %s\n", strerror(errno));
             return -1;
         }
 
@@ -250,11 +289,11 @@ int ebpfdivert_unload(const char *ifname) {
         }
         freeifaddrs(ifaddr);
         cleanup_pinned_resources();
-        printf("Successfully unloaded and detached eBPFDivert from all interfaces\n");
+        pr_info("Successfully unloaded and detached eBPFDivert from all interfaces\n");
     } else {
         int ifindex = if_nametoindex(ifname);
         if (ifindex == 0) {
-            fprintf(stderr, "ERROR: interface '%s' not found\n", ifname);
+            pr_err("ERROR: interface '%s' not found\n", ifname);
             return -1;
         }
         detach_tc_hooks(ifindex);
@@ -264,7 +303,7 @@ int ebpfdivert_unload(const char *ifname) {
             detach_tc_hooks(lo_idx);
         }
         cleanup_pinned_resources();
-        printf("Successfully unloaded and detached eBPFDivert from '%s'\n", ifname);
+        pr_info("Successfully unloaded and detached eBPFDivert from '%s'\n", ifname);
     }
     return 0;
 }
@@ -273,7 +312,7 @@ int ebpfdivert_rules_clear(void) {
     int map_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/filter_rules");
     int map_fd_v6 = bpf_obj_get("/sys/fs/bpf/ebpfdivert/filter_rules_ipv6");
     if (map_fd < 0 || map_fd_v6 < 0) {
-        fprintf(stderr, "ERROR: eBPFDivert maps not found. Is the driver loaded?\n");
+        pr_err("ERROR: eBPFDivert maps not found. Is the driver loaded?\n");
         if (map_fd >= 0) close(map_fd);
         if (map_fd_v6 >= 0) close(map_fd_v6);
         return -1;
@@ -291,7 +330,7 @@ int ebpfdivert_rules_clear(void) {
 
     close(map_fd);
     close(map_fd_v6);
-    printf("Successfully cleared all filter rules\n");
+    pr_info("Successfully cleared all filter rules\n");
     return 0;
 }
 
@@ -299,7 +338,7 @@ int ebpfdivert_rules_list(void) {
     int map_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/filter_rules");
     int map_fd_v6 = bpf_obj_get("/sys/fs/bpf/ebpfdivert/filter_rules_ipv6");
     if (map_fd < 0 || map_fd_v6 < 0) {
-        fprintf(stderr, "ERROR: eBPFDivert maps not found. Is the driver loaded?\n");
+        pr_err("ERROR: eBPFDivert maps not found. Is the driver loaded?\n");
         if (map_fd >= 0) close(map_fd);
         if (map_fd_v6 >= 0) close(map_fd_v6);
         return -1;
@@ -501,21 +540,21 @@ static uint8_t parse_tcp_flags(const char *str) {
 
 int ebpfdivert_rules_add_extended(int idx, const struct ebpfdivert_rule_opt *opt) {
     if (!opt) {
-        fprintf(stderr, "ERROR: invalid NULL opt argument\n");
+        pr_err("ERROR: invalid NULL opt argument\n");
         return -1;
     }
 
     int map_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/filter_rules");
     int map_fd_v6 = bpf_obj_get("/sys/fs/bpf/ebpfdivert/filter_rules_ipv6");
     if (map_fd < 0 || map_fd_v6 < 0) {
-        fprintf(stderr, "ERROR: eBPFDivert maps not found. Is the driver loaded?\n");
+        pr_err("ERROR: eBPFDivert maps not found. Is the driver loaded?\n");
         if (map_fd >= 0) close(map_fd);
         if (map_fd_v6 >= 0) close(map_fd_v6);
         return -1;
     }
 
     if (idx < 0 || idx >= MAX_RULES) {
-        fprintf(stderr, "ERROR: rule index must be between 0 and %d\n", MAX_RULES - 1);
+        pr_err("ERROR: rule index must be between 0 and %d\n", MAX_RULES - 1);
         close(map_fd);
         close(map_fd_v6);
         return -1;
@@ -557,13 +596,13 @@ int ebpfdivert_rules_add_extended(int idx, const struct ebpfdivert_rule_opt *opt
             }
             unsigned long addr = inet_addr(ip_str);
             if (addr == INADDR_NONE) {
-                fprintf(stderr, "ERROR: invalid IP address '%s'\n", ip_str);
+                pr_err("ERROR: invalid IP address '%s'\n", ip_str);
                 close(map_fd);
                 close(map_fd_v6);
                 return -1;
             }
             if (bits < 0 || bits > 32) {
-                fprintf(stderr, "ERROR: invalid CIDR mask bits %d\n", bits);
+                pr_err("ERROR: invalid CIDR mask bits %d\n", bits);
                 close(map_fd);
                 close(map_fd_v6);
                 return -1;
@@ -586,13 +625,13 @@ int ebpfdivert_rules_add_extended(int idx, const struct ebpfdivert_rule_opt *opt
             }
             unsigned long addr = inet_addr(ip_str);
             if (addr == INADDR_NONE) {
-                fprintf(stderr, "ERROR: invalid IP address '%s'\n", ip_str);
+                pr_err("ERROR: invalid IP address '%s'\n", ip_str);
                 close(map_fd);
                 close(map_fd_v6);
                 return -1;
             }
             if (bits < 0 || bits > 32) {
-                fprintf(stderr, "ERROR: invalid CIDR mask bits %d\n", bits);
+                pr_err("ERROR: invalid CIDR mask bits %d\n", bits);
                 close(map_fd);
                 close(map_fd_v6);
                 return -1;
@@ -680,7 +719,7 @@ int ebpfdivert_rules_add_extended(int idx, const struct ebpfdivert_rule_opt *opt
         rule.invert_mask = opt->invert_mask;
 
         if (bpf_map_update_elem(map_fd, &idx, &rule, BPF_ANY)) {
-            fprintf(stderr, "ERROR: updating filter_rules map failed: %s\n", strerror(errno));
+            pr_err("ERROR: updating filter_rules map failed: %s\n", strerror(errno));
             close(map_fd);
             close(map_fd_v6);
             return -1;
@@ -713,13 +752,13 @@ int ebpfdivert_rules_add_extended(int idx, const struct ebpfdivert_rule_opt *opt
                 bits = atoi(slash + 1);
             }
             if (inet_pton(AF_INET6, ip_str, rule.src_ip) != 1) {
-                fprintf(stderr, "ERROR: invalid IPv6 address '%s'\n", ip_str);
+                pr_err("ERROR: invalid IPv6 address '%s'\n", ip_str);
                 close(map_fd);
                 close(map_fd_v6);
                 return -1;
             }
             if (bits < 0 || bits > 128) {
-                fprintf(stderr, "ERROR: invalid IPv6 CIDR mask bits %d\n", bits);
+                pr_err("ERROR: invalid IPv6 CIDR mask bits %d\n", bits);
                 close(map_fd);
                 close(map_fd_v6);
                 return -1;
@@ -748,13 +787,13 @@ int ebpfdivert_rules_add_extended(int idx, const struct ebpfdivert_rule_opt *opt
                 bits = atoi(slash + 1);
             }
             if (inet_pton(AF_INET6, ip_str, rule.dst_ip) != 1) {
-                fprintf(stderr, "ERROR: invalid IPv6 address '%s'\n", ip_str);
+                pr_err("ERROR: invalid IPv6 address '%s'\n", ip_str);
                 close(map_fd);
                 close(map_fd_v6);
                 return -1;
             }
             if (bits < 0 || bits > 128) {
-                fprintf(stderr, "ERROR: invalid IPv6 CIDR mask bits %d\n", bits);
+                pr_err("ERROR: invalid IPv6 CIDR mask bits %d\n", bits);
                 close(map_fd);
                 close(map_fd_v6);
                 return -1;
@@ -849,7 +888,7 @@ int ebpfdivert_rules_add_extended(int idx, const struct ebpfdivert_rule_opt *opt
         rule.invert_mask = opt->invert_mask;
 
         if (bpf_map_update_elem(map_fd_v6, &idx, &rule, BPF_ANY)) {
-            fprintf(stderr, "ERROR: updating filter_rules_ipv6 map failed: %s\n", strerror(errno));
+            pr_err("ERROR: updating filter_rules_ipv6 map failed: %s\n", strerror(errno));
             close(map_fd);
             close(map_fd_v6);
             return -1;
@@ -858,27 +897,27 @@ int ebpfdivert_rules_add_extended(int idx, const struct ebpfdivert_rule_opt *opt
 
     close(map_fd);
     close(map_fd_v6);
-    printf("Successfully added rule at index %d\n", idx);
+    pr_info("Successfully added rule at index %d\n", idx);
     return 0;
 }
 
 int ebpfdivert_rules_add(int idx, const char *proto, const char *ip_cidr, const char *port_range, const char *action) {
     if (!proto || !ip_cidr || !port_range || !action) {
-        fprintf(stderr, "ERROR: invalid NULL argument to ebpfdivert_rules_add\n");
+        pr_err("ERROR: invalid NULL argument to ebpfdivert_rules_add\n");
         return -1;
     }
 
     int map_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/filter_rules");
     int map_fd_v6 = bpf_obj_get("/sys/fs/bpf/ebpfdivert/filter_rules_ipv6");
     if (map_fd < 0 || map_fd_v6 < 0) {
-        fprintf(stderr, "ERROR: eBPFDivert maps not found. Is the driver loaded?\n");
+        pr_err("ERROR: eBPFDivert maps not found. Is the driver loaded?\n");
         if (map_fd >= 0) close(map_fd);
         if (map_fd_v6 >= 0) close(map_fd_v6);
         return -1;
     }
 
     if (idx < 0 || idx >= MAX_RULES) {
-        fprintf(stderr, "ERROR: rule index must be between 0 and %d\n", MAX_RULES - 1);
+        pr_err("ERROR: rule index must be between 0 and %d\n", MAX_RULES - 1);
         close(map_fd);
         close(map_fd_v6);
         return -1;
@@ -919,13 +958,13 @@ int ebpfdivert_rules_add(int idx, const char *proto, const char *ip_cidr, const 
             }
             unsigned long addr = inet_addr(ip_str);
             if (addr == INADDR_NONE) {
-                fprintf(stderr, "ERROR: invalid IP address '%s'\n", ip_str);
+                pr_err("ERROR: invalid IP address '%s'\n", ip_str);
                 close(map_fd);
                 close(map_fd_v6);
                 return -1;
             }
             if (bits < 0 || bits > 32) {
-                fprintf(stderr, "ERROR: invalid CIDR mask bits %d\n", bits);
+                pr_err("ERROR: invalid CIDR mask bits %d\n", bits);
                 close(map_fd);
                 close(map_fd_v6);
                 return -1;
@@ -968,7 +1007,7 @@ int ebpfdivert_rules_add(int idx, const char *proto, const char *ip_cidr, const 
         }
 
         if (bpf_map_update_elem(map_fd, &idx, &rule, BPF_ANY)) {
-            fprintf(stderr, "ERROR: updating filter_rules map failed: %s\n", strerror(errno));
+            pr_err("ERROR: updating filter_rules map failed: %s\n", strerror(errno));
             close(map_fd);
             close(map_fd_v6);
             return -1;
@@ -999,13 +1038,13 @@ int ebpfdivert_rules_add(int idx, const char *proto, const char *ip_cidr, const 
                 bits = atoi(slash + 1);
             }
             if (inet_pton(AF_INET6, ip_str, rule.dst_ip) != 1) {
-                fprintf(stderr, "ERROR: invalid IPv6 address '%s'\n", ip_str);
+                pr_err("ERROR: invalid IPv6 address '%s'\n", ip_str);
                 close(map_fd);
                 close(map_fd_v6);
                 return -1;
             }
             if (bits < 0 || bits > 128) {
-                fprintf(stderr, "ERROR: invalid IPv6 CIDR mask bits %d\n", bits);
+                pr_err("ERROR: invalid IPv6 CIDR mask bits %d\n", bits);
                 close(map_fd);
                 close(map_fd_v6);
                 return -1;
@@ -1055,7 +1094,7 @@ int ebpfdivert_rules_add(int idx, const char *proto, const char *ip_cidr, const 
         }
 
         if (bpf_map_update_elem(map_fd_v6, &idx, &rule, BPF_ANY)) {
-            fprintf(stderr, "ERROR: updating filter_rules_ipv6 map failed: %s\n", strerror(errno));
+            pr_err("ERROR: updating filter_rules_ipv6 map failed: %s\n", strerror(errno));
             close(map_fd);
             close(map_fd_v6);
             return -1;
@@ -1064,7 +1103,7 @@ int ebpfdivert_rules_add(int idx, const char *proto, const char *ip_cidr, const 
 
     close(map_fd);
     close(map_fd_v6);
-    printf("Successfully added rule at index %d\n", idx);
+    pr_info("Successfully added rule at index %d\n", idx);
     return 0;
 }
 
@@ -1183,14 +1222,14 @@ ebpfdivert_handle_t *ebpfdivert_open(uint32_t priority) {
     
     h->ringbuf_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/pcap_ringbuf");
     if (h->ringbuf_fd < 0) {
-        fprintf(stderr, "ERROR: pcap_ringbuf map not found. Is the driver loaded?\n");
+        pr_err("ERROR: pcap_ringbuf map not found. Is the driver loaded?\n");
         free(h);
         return NULL;
     }
     
     h->rb = ring_buffer__new(h->ringbuf_fd, ebpfdivert_rb_callback, h, NULL);
     if (!h->rb) {
-        fprintf(stderr, "ERROR: failed to create ring buffer consumer\n");
+        pr_err("ERROR: failed to create ring buffer consumer\n");
         close(h->ringbuf_fd);
         free(h);
         return NULL;
@@ -1199,7 +1238,7 @@ ebpfdivert_handle_t *ebpfdivert_open(uint32_t priority) {
     h->socks_capacity = 16;
     h->socks = calloc(h->socks_capacity, sizeof(struct if_sock_entry));
     if (!h->socks) {
-        fprintf(stderr, "ERROR: failed to allocate raw sockets cache\n");
+        pr_err("ERROR: failed to allocate raw sockets cache\n");
         ring_buffer__free(h->rb);
         close(h->ringbuf_fd);
         free(h);

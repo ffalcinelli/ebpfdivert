@@ -162,7 +162,16 @@ int cli_sniff(const char *pcap_filename) {
     return 0;
 }
 
+int cli_print_fn(enum ebpfdivert_print_level level, const char *format, va_list args) {
+    if (level <= EBPFDIVERT_WARN) {
+        return vfprintf(stderr, format, args);
+    } else {
+        return vfprintf(stdout, format, args);
+    }
+}
+
 int main(int argc, char **argv) {
+    ebpfdivert_set_print(cli_print_fn);
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;

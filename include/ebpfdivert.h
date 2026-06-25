@@ -5,6 +5,18 @@
 #include <stdint.h>
 #include "ebpfdivert_shared.h"
 
+#include <stdarg.h>
+
+enum ebpfdivert_print_level {
+    EBPFDIVERT_ERROR = 0,
+    EBPFDIVERT_WARN  = 1,
+    EBPFDIVERT_INFO  = 2,
+    EBPFDIVERT_DEBUG = 3,
+};
+
+typedef int (*ebpfdivert_print_fn_t)(enum ebpfdivert_print_level level, const char *format, va_list args);
+void ebpfdivert_set_print(ebpfdivert_print_fn_t print_fn);
+
 #ifdef __cplusplus
 extern "C" {
 #endif
