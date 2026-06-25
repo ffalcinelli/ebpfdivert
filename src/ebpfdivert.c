@@ -18,6 +18,28 @@
 #include <sys/mman.h>
 #include "ebpfdivert.h"
 
+#include <stdarg.h>
+
+static int ebpfdivert_libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
+    char buf[512];
+    va_list args_copy;
+    va_copy(args_copy, args);
+    vsnprintf(buf, sizeof(buf), format, args_copy);
+    va_end(args_copy);
+
+    // Silence expected benign warnings from libbpf during TC load/unload operations
+    if (strstr(buf, "Invalid handle") != NULL || 
+        strstr(buf, "Exclusivity flag on") != NULL ||
+        strstr(buf, "Cannot find specified qdisc") != NULL ||
+        strstr(buf, "Kernel error message") != NULL) {
+        return 0;
+    }
+    if (level <= LIBBPF_WARN) {
+        return vfprintf(stderr, format, args);
+    }
+    return 0;
+}
+
 static void cleanup_pinned_resources(void) {
     const char *map_names[] = {"filter_rules", "filter_rules_ipv6", "stats_map", "config_map", "pcap_ringbuf"};
     for (int i = 0; i < 5; i++) {
@@ -79,11 +101,16 @@ static int detach_tc_hooks(int ifindex) {
         .ifindex = ifindex,
         .attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS
     );
+    // Check if a TC hook/qdisc exists on this interface first to prevent "Invalid handle" warning noise from libbpf
+    if (bpf_tc_query(&hook, NULL) == -ENOENT) {
+        return 0;
+    }
     int err = bpf_tc_hook_destroy(&hook);
     return err;
 }
 
 int ebpfdivert_load(const char *ifname, const char *obj_path, uint32_t priority) {
+    libbpf_set_print(ebpfdivert_libbpf_print_fn);
     // Forcefully detach/unload any existing hooks on the interface(s) to avoid EEXIST and out-of-sync maps!
     ebpfdivert_unload(ifname);
 
@@ -202,6 +229,7 @@ int ebpfdivert_load(const char *ifname, const char *obj_path, uint32_t priority)
 }
 
 int ebpfdivert_unload(const char *ifname) {
+    libbpf_set_print(ebpfdivert_libbpf_print_fn);
     int detach_all = (ifname == NULL || strcmp(ifname, "all") == 0);
 
     if (detach_all) {
