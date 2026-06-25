@@ -33,6 +33,9 @@ jobs:
           ls -l /sys/kernel/btf/vmlinux || echo "BTF not found in /sys/kernel/btf/vmlinux"
           uname -a
 
+      - name: Verify Version Alignment
+        run: make check-version
+
       - name: Build
         run: make
 

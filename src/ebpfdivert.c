@@ -26,6 +26,10 @@ void ebpfdivert_set_print(ebpfdivert_print_fn_t print_fn) {
     ebpfdivert_user_print_fn = print_fn;
 }
 
+const char *ebpfdivert_version(void) {
+    return EBPFDIVERT_VERSION;
+}
+
 static int default_print_fn(enum ebpfdivert_print_level level, const char *format, va_list args) {
     if (level <= EBPFDIVERT_WARN) {
         return vfprintf(stderr, format, args);

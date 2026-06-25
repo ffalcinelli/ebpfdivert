@@ -19,6 +19,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev make gcc linux-headers-generic
 
+      - name: Verify Version Alignment
+        run: make check-version
+
       - name: Build and Package
         run: |
           # Compile the project
@@ -43,5 +46,5 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag_name="${GITHUB_REF##*/}"
-          gh release create "$tag_name" ebpfdivert.bpf.o "$TARBALL_NAME" --title "Release $tag_name" --notes "Automated release for $tag_name"
+          gh release create "$tag_name" "$TARBALL_NAME" --title "Release $tag_name" --notes "Automated release for $tag_name"
 

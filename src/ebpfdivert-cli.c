@@ -21,6 +21,7 @@ void print_usage(const char *prog_name) {
     printf("                                      dst_port_range: e.g. 80, 8000-8010, type/code for icmp, any\n");
     printf("                                      action: divert, drop, sniff\n");
     printf("  rules add-ext <idx> <action> [opts] Add advanced rule with source matching, loopback, direction, TCP flags, TTL, and inversion options\n");
+    printf("  version                             Print version information\n");
 }
 
 int cli_stats() {
@@ -178,6 +179,11 @@ int main(int argc, char **argv) {
     }
 
     const char *cmd = argv[1];
+
+    if (strcmp(cmd, "version") == 0 || strcmp(cmd, "--version") == 0 || strcmp(cmd, "-v") == 0) {
+        printf("ebpfdivert-cli version %s (libebpfdivert %s)\n", EBPFDIVERT_VERSION, ebpfdivert_version());
+        return 0;
+    }
 
     if (strcmp(cmd, "load") == 0) {
         const char *ifname = NULL;

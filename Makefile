@@ -37,7 +37,11 @@ clean:
 PREFIX ?= /usr/local
 INSTALL ?= install
 
-.PHONY: all clean install uninstall
+.PHONY: all clean install uninstall check-version
+
+check-version:
+	./scripts/check_version.sh
+
 
 install: all
 	$(INSTALL) -d $(DESTDIR)$(PREFIX)/bin

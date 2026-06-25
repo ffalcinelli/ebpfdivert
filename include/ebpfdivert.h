@@ -2,6 +2,8 @@
 #ifndef EBPFDIVERT_H
 #define EBPFDIVERT_H
 
+#define EBPFDIVERT_VERSION "0.0.3"
+
 #include <stdint.h>
 #include "ebpfdivert_shared.h"
 
@@ -20,6 +22,8 @@ void ebpfdivert_set_print(ebpfdivert_print_fn_t print_fn);
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+const char *ebpfdivert_version(void);
 
 int ebpfdivert_load(const char *ifname, const char *obj_path, uint32_t priority);
 int ebpfdivert_unload(const char *ifname);
