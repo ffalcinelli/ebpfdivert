@@ -1114,6 +1114,10 @@ int ebpfdivert_get_stats(uint64_t *stats, int stats_len) {
     }
 
     int num_cpus = libbpf_num_possible_cpus();
+    if (num_cpus <= 0) {
+        close(stats_fd);
+        return -1;
+    }
     __u64 values[num_cpus];
 
     for (__u32 key = 0; key < (__u32)stats_len; key++) {
