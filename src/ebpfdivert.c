@@ -84,6 +84,9 @@ static int detach_tc_hooks(int ifindex) {
 }
 
 int ebpfdivert_load(const char *ifname, const char *obj_path, uint32_t priority) {
+    // Forcefully detach/unload any existing hooks on the interface(s) to avoid EEXIST and out-of-sync maps!
+    ebpfdivert_unload(ifname);
+
     int attach_all = (ifname == NULL || strcmp(ifname, "all") == 0);
     int ifindex = 0;
     if (!attach_all) {
@@ -1238,7 +1241,7 @@ int ebpfdivert_send(ebpfdivert_handle_t *h, const struct divert_packet_buffer *b
     
     int bind_ifindex = is_redirect ? lo_idx : target_ifindex;
     if (target_ifindex == lo_idx) {
-        is_redirect = 0;
+        is_redirect = 1;
         bind_ifindex = lo_idx;
     }
     

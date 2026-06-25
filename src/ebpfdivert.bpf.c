@@ -77,7 +77,7 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
     void *data_end = (void *)(long)skb->data_end;
     void *data = (void *)(long)skb->data;
 
-    bpf_printk("parse_packet: len=%d, proto=%x, data_len=%d", skb->len, bpf_ntohs(skb->protocol), (int)(data_end - data));
+
 
     __u16 l2_len = 0;
     int found = 0;
@@ -86,8 +86,7 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
     // 1. Try Ethernet (14 bytes)
     if (data + 14 <= data_end) {
         __u16 ethertype = bpf_ntohs(*(__u16 *)((char *)data + 12));
-        bpf_printk("  14B check: %02x %02x %02x %02x ... ethertype=%x", 
-                   *(__u8 *)data, *((__u8 *)data+1), *((__u8 *)data+2), *((__u8 *)data+3), ethertype);
+
         if (ethertype == 0x0800 || ethertype == 0x86DD) {
             l2_len = 14;
             found = 1;
@@ -260,6 +259,7 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
     }
 
     pkt->parsed_ok = 1;
+
     return 1;
 }
 
@@ -441,6 +441,8 @@ int tc_divert_ingress(struct __sk_buff *skb) {
     if ((skb->mark & 0xFFFF0000) == REDIRECT_MARK_MASK) {
         __u32 target_ifindex = skb->mark & 0xFFFF;
         if (skb->ifindex == target_ifindex) {
+            skb->mark = 0;
+            bpf_skb_change_type(skb, 0); // 0 is PACKET_HOST
             return TC_ACT_UNSPEC;
         }
         return bpf_redirect(target_ifindex, BPF_F_INGRESS);
