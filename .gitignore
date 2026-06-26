@@ -56,3 +56,6 @@ dkms.conf
 .idea/
 *.swp
 *~
+ebpfdivert-cli
+tracelog.txt
+test_integration

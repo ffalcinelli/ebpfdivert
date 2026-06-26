@@ -10,10 +10,18 @@ permissions:
   contents: read
 
 jobs:
+  verify-pinning:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Verify Pinning
+        uses: ffalcinelli/pinner/action@dff77e1d17140dc88eb827aa7d833f995796b92b # v0.0.11
+
   build-and-test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install dependencies
         run: |
@@ -24,6 +32,9 @@ jobs:
         run: |
           ls -l /sys/kernel/btf/vmlinux || echo "BTF not found in /sys/kernel/btf/vmlinux"
           uname -a
+
+      - name: Verify Version Alignment
+        run: make check-version
 
       - name: Build
         run: make

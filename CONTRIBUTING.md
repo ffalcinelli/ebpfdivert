@@ -16,11 +16,14 @@ First off, thank you for considering contributing to eBPFDivert! It's people lik
 1. Fork the repository.
 2. Create a new branch for your feature or bugfix.
 3. Ensure your code follows the existing style (Linux Kernel BPF coding standards).
-4. Update the test suite in `tests/test_bpf.c` if necessary.
+4. Update the test suite in `tests/test_bpf.c` and/or `tests/test_integration.c` if necessary.
 5. Verify your changes using the Vagrant environment:
    ```bash
    vagrant up
+   # Run BPF mock tests
    vagrant ssh -c "cd /vagrant && make clean && make && sudo ./test_bpf ebpfdivert.bpf.o"
+   # Run integration tests
+   vagrant ssh -c "cd /vagrant && sudo ./tests/run_integration_tests.sh"
    ```
 6. Submit a PR against the `main` branch.
 
