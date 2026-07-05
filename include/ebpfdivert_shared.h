@@ -32,6 +32,7 @@
 #define MATCH_DROP           (1 << 10)
 #define MATCH_TTL            (1 << 11)
 #define MATCH_TCP_FLAGS      (1 << 12)
+#define MATCH_LPM_TRIE      (1 << 13)
 
 struct divert_pkt_header {
     __u32 pkt_len;
