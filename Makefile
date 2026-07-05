@@ -1,5 +1,5 @@
 CLANG ?= clang
-CFLAGS ?= -O2 -g -Wall -Wextra
+CFLAGS ?= -O2 -g -Wall -Wextra -Werror
 LIBBPF_LIBS ?= -lbpf
 INCLUDES := -Iinclude -Isrc
 

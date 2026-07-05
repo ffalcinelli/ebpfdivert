@@ -126,12 +126,8 @@ static int attach_tc_hooks(int ifindex, struct bpf_program *prog_ingress, struct
     err = bpf_tc_attach(&hook_egress, &opts_egress);
     if (err && err != -EEXIST) {
         pr_err("ERROR: attaching egress program to ifindex %d failed: %s\n", ifindex, strerror(-err));
-        DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook_ingress_del,
-            .ifindex = ifindex,
-            .attach_point = BPF_TC_INGRESS
-        );
-        bpf_tc_detach(&hook_ingress_del, &opts_ingress);
-        bpf_tc_hook_destroy(&hook_ingress_del);
+        bpf_tc_detach(&hook_ingress, &opts_ingress);
+        bpf_tc_hook_destroy(&hook_ingress);
         bpf_tc_hook_destroy(&hook_egress);
         return -1;
     }
@@ -1439,8 +1435,16 @@ int ebpfdivert_add_subnet_rule(ebpfdivert_handle_t *h, const char *ip_cidr, uint
 
     char ip_str[64] = {0};
     int prefixlen = -1;
-    if (sscanf(ip_cidr, "%63[^/]/%d", ip_str, &prefixlen) < 1) {
-        return -EINVAL;
+    const char *slash = strchr(ip_cidr, '/');
+    if (slash) {
+        size_t len = slash - ip_cidr;
+        if (len >= sizeof(ip_str)) return -EINVAL;
+        strncpy(ip_str, ip_cidr, len);
+        prefixlen = atoi(slash + 1);
+        if (prefixlen < 0) return -EINVAL;
+    } else {
+        if (strlen(ip_cidr) >= sizeof(ip_str)) return -EINVAL;
+        strcpy(ip_str, ip_cidr);
     }
 
     // Try IPv4 first
@@ -1488,8 +1492,16 @@ int ebpfdivert_delete_subnet_rule(ebpfdivert_handle_t *h, const char *ip_cidr) {
 
     char ip_str[64] = {0};
     int prefixlen = -1;
-    if (sscanf(ip_cidr, "%63[^/]/%d", ip_str, &prefixlen) < 1) {
-        return -EINVAL;
+    const char *slash = strchr(ip_cidr, '/');
+    if (slash) {
+        size_t len = slash - ip_cidr;
+        if (len >= sizeof(ip_str)) return -EINVAL;
+        strncpy(ip_str, ip_cidr, len);
+        prefixlen = atoi(slash + 1);
+        if (prefixlen < 0) return -EINVAL;
+    } else {
+        if (strlen(ip_cidr) >= sizeof(ip_str)) return -EINVAL;
+        strcpy(ip_str, ip_cidr);
     }
 
     struct in_addr ipv4;
