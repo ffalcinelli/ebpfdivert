@@ -28,6 +28,32 @@ struct {
     __type(value, struct filter_rule_ipv6);
 } filter_rules_ipv6 SEC(".maps");
 
+struct bpf_lpm_trie_key_u4 {
+    __u32 prefixlen;
+    __u32 ipv4_addr;
+};
+
+struct bpf_lpm_trie_key_u6 {
+    __u32 prefixlen;
+    __u8 ipv6_addr[16];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 1024);
+    __type(key, struct bpf_lpm_trie_key_u4);
+    __type(value, __u32);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} ipv4_lpm_trie SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 1024);
+    __type(key, struct bpf_lpm_trie_key_u6);
+    __type(value, __u32);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} ipv6_lpm_trie SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 6);
@@ -77,7 +103,7 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
     void *data_end = (void *)(long)skb->data_end;
     void *data = (void *)(long)skb->data;
 
-
+    bpf_printk("parse_packet: len=%d, proto=%x, data_len=%d", skb->len, bpf_ntohs(skb->protocol), (int)(data_end - data));
 
     __u16 l2_len = 0;
     int found = 0;
@@ -86,7 +112,8 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
     // 1. Try Ethernet (14 bytes)
     if (data + 14 <= data_end) {
         __u16 ethertype = bpf_ntohs(*(__u16 *)((char *)data + 12));
-
+        bpf_printk("  14B check: %02x %02x %02x %02x ... ethertype=%x", 
+                   *(__u8 *)data, *((__u8 *)data+1), *((__u8 *)data+2), *((__u8 *)data+3), ethertype);
         if (ethertype == 0x0800 || ethertype == 0x86DD) {
             l2_len = 14;
             found = 1;
@@ -259,7 +286,8 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
     }
 
     pkt->parsed_ok = 1;
-
+    bpf_printk("parse_packet parsed: ver=%d proto=%d src=%x dst=%x sport=%d dport=%d ok=%d",
+               pkt->ver, pkt->proto, pkt->src_ip, pkt->dst_ip, pkt->src_port, pkt->dst_port, pkt->parsed_ok);
     return 1;
 }
 
@@ -274,8 +302,35 @@ static __always_inline int matches_rule_ipv4(struct parsed_packet *pkt, struct f
 
     if (pkt->ver != 4) return 0;
 
-    if ((rule->match_mask & MATCH_SRC_IP) && (((pkt->src_ip & rule->src_mask) == (rule->src_ip & rule->src_mask)) == !!(rule->invert_mask & MATCH_SRC_IP))) return 0;
-    if ((rule->match_mask & MATCH_DST_IP) && (((pkt->dst_ip & rule->dst_mask) == (rule->dst_ip & rule->dst_mask)) == !!(rule->invert_mask & MATCH_DST_IP))) return 0;
+    if (rule->match_mask & MATCH_LPM_TRIE) {
+        if (rule->match_mask & MATCH_SRC_IP) {
+            struct bpf_lpm_trie_key_u4 key = {
+                .prefixlen = 32,
+                .ipv4_addr = bpf_htonl(pkt->src_ip)
+            };
+            __u32 *val = bpf_map_lookup_elem(&ipv4_lpm_trie, &key);
+            if (!val || !(*val & MATCH_SRC_IP)) {
+                if (!(rule->invert_mask & MATCH_SRC_IP)) return 0;
+            } else {
+                if (rule->invert_mask & MATCH_SRC_IP) return 0;
+            }
+        }
+        if (rule->match_mask & MATCH_DST_IP) {
+            struct bpf_lpm_trie_key_u4 key = {
+                .prefixlen = 32,
+                .ipv4_addr = bpf_htonl(pkt->dst_ip)
+            };
+            __u32 *val = bpf_map_lookup_elem(&ipv4_lpm_trie, &key);
+            if (!val || !(*val & MATCH_DST_IP)) {
+                if (!(rule->invert_mask & MATCH_DST_IP)) return 0;
+            } else {
+                if (rule->invert_mask & MATCH_DST_IP) return 0;
+            }
+        }
+    } else {
+        if ((rule->match_mask & MATCH_SRC_IP) && (((pkt->src_ip & rule->src_mask) == (rule->src_ip & rule->src_mask)) == !!(rule->invert_mask & MATCH_SRC_IP))) return 0;
+        if ((rule->match_mask & MATCH_DST_IP) && (((pkt->dst_ip & rule->dst_mask) == (rule->dst_ip & rule->dst_mask)) == !!(rule->invert_mask & MATCH_DST_IP))) return 0;
+    }
     if ((rule->match_mask & MATCH_SRC_PORT) && (((pkt->src_port >= rule->src_port_start && pkt->src_port <= rule->src_port_end)) == !!(rule->invert_mask & MATCH_SRC_PORT))) return 0;
     if ((rule->match_mask & MATCH_DST_PORT) && (((pkt->dst_port >= rule->dst_port_start && pkt->dst_port <= rule->dst_port_end)) == !!(rule->invert_mask & MATCH_DST_PORT))) return 0;
     if ((rule->match_mask & MATCH_PROTO) && ((pkt->proto == rule->proto) == !!(rule->invert_mask & MATCH_PROTO))) return 0;
@@ -302,16 +357,39 @@ static __always_inline int matches_rule_ipv6(struct parsed_packet *pkt, struct f
 
     if (pkt->ver != 6) return 0;
 
-    if (rule->match_mask & MATCH_SRC_IP) {
-        int ip_match = ((pkt->src_ip6_u64[0] & rule->src_mask_u64[0]) == (rule->src_ip_u64[0] & rule->src_mask_u64[0])) &&
-                       ((pkt->src_ip6_u64[1] & rule->src_mask_u64[1]) == (rule->src_ip_u64[1] & rule->src_mask_u64[1]));
-        if (ip_match == !!(rule->invert_mask & MATCH_SRC_IP)) return 0;
-    }
+    if (rule->match_mask & MATCH_LPM_TRIE) {
+        if (rule->match_mask & MATCH_SRC_IP) {
+            struct bpf_lpm_trie_key_u6 key = { .prefixlen = 128 };
+            __builtin_memcpy(key.ipv6_addr, pkt->src_ip6, 16);
+            __u32 *val = bpf_map_lookup_elem(&ipv6_lpm_trie, &key);
+            if (!val || !(*val & MATCH_SRC_IP)) {
+                if (!(rule->invert_mask & MATCH_SRC_IP)) return 0;
+            } else {
+                if (rule->invert_mask & MATCH_SRC_IP) return 0;
+            }
+        }
+        if (rule->match_mask & MATCH_DST_IP) {
+            struct bpf_lpm_trie_key_u6 key = { .prefixlen = 128 };
+            __builtin_memcpy(key.ipv6_addr, pkt->dst_ip6, 16);
+            __u32 *val = bpf_map_lookup_elem(&ipv6_lpm_trie, &key);
+            if (!val || !(*val & MATCH_DST_IP)) {
+                if (!(rule->invert_mask & MATCH_DST_IP)) return 0;
+            } else {
+                if (rule->invert_mask & MATCH_DST_IP) return 0;
+            }
+        }
+    } else {
+        if (rule->match_mask & MATCH_SRC_IP) {
+            int ip_match = ((pkt->src_ip6_u64[0] & rule->src_mask_u64[0]) == (rule->src_ip_u64[0] & rule->src_mask_u64[0])) &&
+                           ((pkt->src_ip6_u64[1] & rule->src_mask_u64[1]) == (rule->src_ip_u64[1] & rule->src_mask_u64[1]));
+            if (ip_match == !!(rule->invert_mask & MATCH_SRC_IP)) return 0;
+        }
 
-    if (rule->match_mask & MATCH_DST_IP) {
-        int ip_match = ((pkt->dst_ip6_u64[0] & rule->dst_mask_u64[0]) == (rule->dst_ip_u64[0] & rule->dst_mask_u64[0])) &&
-                       ((pkt->dst_ip6_u64[1] & rule->dst_mask_u64[1]) == (rule->dst_ip_u64[1] & rule->dst_mask_u64[1]));
-        if (ip_match == !!(rule->invert_mask & MATCH_DST_IP)) return 0;
+        if (rule->match_mask & MATCH_DST_IP) {
+            int ip_match = ((pkt->dst_ip6_u64[0] & rule->dst_mask_u64[0]) == (rule->dst_ip_u64[0] & rule->dst_mask_u64[0])) &&
+                           ((pkt->dst_ip6_u64[1] & rule->dst_mask_u64[1]) == (rule->dst_ip_u64[1] & rule->dst_mask_u64[1]));
+            if (ip_match == !!(rule->invert_mask & MATCH_DST_IP)) return 0;
+        }
     }
 
     if ((rule->match_mask & MATCH_SRC_PORT) && (((pkt->src_port >= rule->src_port_start && pkt->src_port <= rule->src_port_end)) == !!(rule->invert_mask & MATCH_SRC_PORT))) return 0;
@@ -440,9 +518,11 @@ SEC("classifier")
 int tc_divert_ingress(struct __sk_buff *skb) {
     if ((skb->mark & 0xFFFF0000) == REDIRECT_MARK_MASK) {
         __u32 target_ifindex = skb->mark & 0xFFFF;
+        bpf_printk("tc_divert_ingress redirect: ifindex=%u target=%u pkt_type=%u", skb->ifindex, target_ifindex, skb->pkt_type);
         if (skb->ifindex == target_ifindex) {
             skb->mark = 0;
-            bpf_skb_change_type(skb, 0); // 0 is PACKET_HOST
+            int ret = bpf_skb_change_type(skb, 0); // 0 is PACKET_HOST
+            bpf_printk("  bpf_skb_change_type ret=%d new pkt_type=%u", ret, skb->pkt_type);
             return TC_ACT_UNSPEC;
         }
         return bpf_redirect(target_ifindex, BPF_F_INGRESS);

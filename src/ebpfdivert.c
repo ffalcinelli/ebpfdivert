@@ -84,8 +84,8 @@ static int ebpfdivert_libbpf_print_fn(enum libbpf_print_level level, const char 
 }
 
 static void cleanup_pinned_resources(void) {
-    const char *map_names[] = {"filter_rules", "filter_rules_ipv6", "stats_map", "config_map", "pcap_ringbuf"};
-    for (int i = 0; i < 5; i++) {
+    const char *map_names[] = {"filter_rules", "filter_rules_ipv6", "stats_map", "config_map", "pcap_ringbuf", "ipv4_lpm_trie", "ipv6_lpm_trie"};
+    for (int i = 0; i < 7; i++) {
         char pin_path[256];
         snprintf(pin_path, sizeof(pin_path), "/sys/fs/bpf/ebpfdivert/%s", map_names[i]);
         unlink(pin_path);
@@ -181,8 +181,8 @@ int ebpfdivert_load(const char *ifname, const char *obj_path, uint32_t priority)
 
     mkdir("/sys/fs/bpf/ebpfdivert", 0755);
 
-    const char *map_names[] = {"filter_rules", "filter_rules_ipv6", "stats_map", "config_map", "pcap_ringbuf"};
-    for (int i = 0; i < 5; i++) {
+    const char *map_names[] = {"filter_rules", "filter_rules_ipv6", "stats_map", "config_map", "pcap_ringbuf", "ipv4_lpm_trie", "ipv6_lpm_trie"};
+    for (int i = 0; i < 7; i++) {
         struct bpf_map *map = bpf_object__find_map_by_name(obj, map_names[i]);
         if (map) {
             char pin_path[256];
@@ -1418,3 +1418,115 @@ void ebpfdivert_close(ebpfdivert_handle_t *h) {
     }
     free(h);
 }
+
+int ebpfdivert_get_fd(ebpfdivert_handle_t *h) {
+    if (!h) return -EINVAL;
+    return h->ringbuf_fd;
+}
+
+struct bpf_lpm_trie_key_u4 {
+    __u32 prefixlen;
+    __u32 ipv4_addr;
+};
+
+struct bpf_lpm_trie_key_u6 {
+    __u32 prefixlen;
+    __u8 ipv6_addr[16];
+};
+
+int ebpfdivert_add_subnet_rule(ebpfdivert_handle_t *h, const char *ip_cidr, uint32_t action_mask) {
+    if (!h || !ip_cidr) return -EINVAL;
+
+    char ip_str[64] = {0};
+    int prefixlen = -1;
+    if (sscanf(ip_cidr, "%63[^/]/%d", ip_str, &prefixlen) < 1) {
+        return -EINVAL;
+    }
+
+    // Try IPv4 first
+    struct in_addr ipv4;
+    if (inet_pton(AF_INET, ip_str, &ipv4) == 1) {
+        if (prefixlen < 0) prefixlen = 32;
+        if (prefixlen > 32) return -EINVAL;
+
+        struct bpf_lpm_trie_key_u4 key = {
+            .prefixlen = prefixlen,
+            .ipv4_addr = ipv4.s_addr
+        };
+        int map_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/ipv4_lpm_trie");
+        if (map_fd < 0) return map_fd;
+
+        int ret = bpf_map_update_elem(map_fd, &key, &action_mask, BPF_ANY);
+        close(map_fd);
+        return ret;
+    }
+
+    // Try IPv6
+    struct in6_addr ipv6;
+    if (inet_pton(AF_INET6, ip_str, &ipv6) == 1) {
+        if (prefixlen < 0) prefixlen = 128;
+        if (prefixlen > 128) return -EINVAL;
+
+        struct bpf_lpm_trie_key_u6 key = {
+            .prefixlen = prefixlen
+        };
+        memcpy(key.ipv6_addr, &ipv6, 16);
+
+        int map_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/ipv6_lpm_trie");
+        if (map_fd < 0) return map_fd;
+
+        int ret = bpf_map_update_elem(map_fd, &key, &action_mask, BPF_ANY);
+        close(map_fd);
+        return ret;
+    }
+
+    return -EINVAL;
+}
+
+int ebpfdivert_delete_subnet_rule(ebpfdivert_handle_t *h, const char *ip_cidr) {
+    if (!h || !ip_cidr) return -EINVAL;
+
+    char ip_str[64] = {0};
+    int prefixlen = -1;
+    if (sscanf(ip_cidr, "%63[^/]/%d", ip_str, &prefixlen) < 1) {
+        return -EINVAL;
+    }
+
+    struct in_addr ipv4;
+    if (inet_pton(AF_INET, ip_str, &ipv4) == 1) {
+        if (prefixlen < 0) prefixlen = 32;
+        if (prefixlen > 32) return -EINVAL;
+
+        struct bpf_lpm_trie_key_u4 key = {
+            .prefixlen = prefixlen,
+            .ipv4_addr = ipv4.s_addr
+        };
+        int map_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/ipv4_lpm_trie");
+        if (map_fd < 0) return map_fd;
+
+        int ret = bpf_map_delete_elem(map_fd, &key);
+        close(map_fd);
+        return ret;
+    }
+
+    struct in6_addr ipv6;
+    if (inet_pton(AF_INET6, ip_str, &ipv6) == 1) {
+        if (prefixlen < 0) prefixlen = 128;
+        if (prefixlen > 128) return -EINVAL;
+
+        struct bpf_lpm_trie_key_u6 key = {
+            .prefixlen = prefixlen
+        };
+        memcpy(key.ipv6_addr, &ipv6, 16);
+
+        int map_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/ipv6_lpm_trie");
+        if (map_fd < 0) return map_fd;
+
+        int ret = bpf_map_delete_elem(map_fd, &key);
+        close(map_fd);
+        return ret;
+    }
+
+    return -EINVAL;
+}
+

@@ -11,6 +11,16 @@
 #include <linux/ipv6.h>
 #include "ebpfdivert_shared.h"
 
+struct bpf_lpm_trie_key_u4 {
+    __u32 prefixlen;
+    __u32 ipv4_addr;
+};
+
+struct bpf_lpm_trie_key_u6 {
+    __u32 prefixlen;
+    __u8 ipv6_addr[16];
+};
+
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
     (void)level;
     return vfprintf(stderr, format, args);
@@ -443,8 +453,10 @@ int main(int argc, char **argv) {
     int stats_fd = bpf_object__find_map_fd_by_name(obj, "stats_map");
     int ringbuf_fd = bpf_object__find_map_fd_by_name(obj, "pcap_ringbuf");
     int config_fd = bpf_object__find_map_fd_by_name(obj, "config_map");
+    int lpm_fd = bpf_object__find_map_fd_by_name(obj, "ipv4_lpm_trie");
+    int lpm_fd_v6 = bpf_object__find_map_fd_by_name(obj, "ipv6_lpm_trie");
     struct bpf_program *prog = bpf_object__find_program_by_name(obj, "tc_divert_egress");
-    if (map_fd < 0 || map_fd_v6 < 0 || stats_fd < 0 || ringbuf_fd < 0 || config_fd < 0 || !prog) {
+    if (map_fd < 0 || map_fd_v6 < 0 || stats_fd < 0 || ringbuf_fd < 0 || config_fd < 0 || lpm_fd < 0 || lpm_fd_v6 < 0 || !prog) {
         fprintf(stderr, "ERROR: finding maps or program failed\n");
         return 1;
     }
@@ -559,6 +571,35 @@ int main(int argc, char **argv) {
     update_rule_icmp6(map_fd_v6, 0, 128, 0, MATCH_SRC_PORT | MATCH_DST_PORT);
     test_packet_icmp6(prog_fd, rb, "ICMPv6 Match and Divert (Echo Request)", 4, 128, 0, 1);
     test_packet_icmp6(prog_fd, rb, "ICMPv6 Mismatch - different type (Echo Reply)", -1, 129, 0, 0);
+
+    // Case 18: IPv4 LPM Trie match
+    update_rule_advanced(map_fd, 0,
+                          0, 0, 0, 0, // IPs
+                          0, 0, 80, 80, // dst port 80
+                          MATCH_SRC_IP | MATCH_DST_PORT | MATCH_LPM_TRIE, 0);
+    struct bpf_lpm_trie_key_u4 lpm_key = {
+        .prefixlen = 24,
+        .ipv4_addr = inet_addr("10.200.1.0")
+    };
+    __u32 action = MATCH_SRC_IP;
+    bpf_map_update_elem(lpm_fd, &lpm_key, &action, BPF_ANY);
+    test_packet_advanced(prog_fd, rb, "IPv4 LPM Trie Match (inside /24)", 4, "10.200.1.5", "10.200.2.5", 12345, 80, 1);
+    test_packet_advanced(prog_fd, rb, "IPv4 LPM Trie Mismatch (outside /24)", -1, "10.200.99.5", "10.200.2.5", 12345, 80, 0);
+
+    // Case 19: IPv6 LPM Trie match
+    update_rule_ipv6_advanced(map_fd_v6, 0,
+                               NULL, NULL, // src
+                               NULL, NULL, // dst subnet
+                               0, 0, 80, 80, // dst port 80
+                               MATCH_DST_IP | MATCH_DST_PORT | MATCH_LPM_TRIE, 0);
+    struct bpf_lpm_trie_key_u6 lpm_key_v6 = {
+        .prefixlen = 48
+    };
+    inet_pton(AF_INET6, "2001:db8:abcd::", lpm_key_v6.ipv6_addr);
+    __u32 action_v6 = MATCH_DST_IP;
+    bpf_map_update_elem(lpm_fd_v6, &lpm_key_v6, &action_v6, BPF_ANY);
+    test_packet_ipv6_advanced(prog_fd, rb, "IPv6 LPM Trie Match (inside /48)", 4, "::1", "2001:db8:abcd:12::56", 12345, 80, 1);
+    test_packet_ipv6_advanced(prog_fd, rb, "IPv6 LPM Trie Mismatch (outside /48)", -1, "::1", "2001:db8:ffff:12::56", 12345, 80, 0);
 
     printf("All eBPF C Tests passed!\n");
     ring_buffer__free(rb);

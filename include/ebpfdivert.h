@@ -63,6 +63,9 @@ int ebpfdivert_recv(ebpfdivert_handle_t *h, struct divert_packet_buffer *buf, si
 int ebpfdivert_send(ebpfdivert_handle_t *h, const struct divert_packet_buffer *buf);
 int ebpfdivert_set_max_queue_size(ebpfdivert_handle_t *h, int size);
 void ebpfdivert_close(ebpfdivert_handle_t *h);
+int ebpfdivert_get_fd(ebpfdivert_handle_t *h);
+int ebpfdivert_add_subnet_rule(ebpfdivert_handle_t *h, const char *ip_cidr, uint32_t action_mask);
+int ebpfdivert_delete_subnet_rule(ebpfdivert_handle_t *h, const char *ip_cidr);
 
 #ifdef __cplusplus
 }
