@@ -2,7 +2,7 @@
 #ifndef EBPFDIVERT_H
 #define EBPFDIVERT_H
 
-#define EBPFDIVERT_VERSION "0.0.3"
+#define EBPFDIVERT_VERSION "0.0.4"
 
 #include <stdint.h>
 #include "ebpfdivert_shared.h"
