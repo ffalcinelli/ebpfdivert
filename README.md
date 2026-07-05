@@ -162,9 +162,15 @@ struct divert_packet_buffer {
     uint8_t data[2048]; // Packet payload
 };
 ```
+## Documentation
+
+- [Architecture Overview](file:///home/fabio/Workspace/divert/ebpfdivert/docs/architecture.md)
+- [Filtering Rules Reference](file:///home/fabio/Workspace/divert/ebpfdivert/docs/rules_reference.md)
+- [C API Reference](file:///home/fabio/Workspace/divert/ebpfdivert/docs/api_reference.md)
 
 ## Contributing
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions are welcome! Please see [CONTRIBUTING.md](file:///home/fabio/Workspace/divert/ebpfdivert/CONTRIBUTING.md) for guidelines.
 
 ## License
-Dual-licensed under **GPLv2** and **LGPLv3**. See [LICENSE](LICENSE) for details.
+Dual-licensed under **GPLv2** and **LGPLv3**. See [LICENSE](file:///home/fabio/Workspace/divert/ebpfdivert/LICENSE) for details.
+

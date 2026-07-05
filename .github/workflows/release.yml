@@ -46,5 +46,5 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag_name="${GITHUB_REF##*/}"
-          gh release create "$tag_name" "$TARBALL_NAME" --title "Release $tag_name" --notes "Automated release for $tag_name"
+          gh release create "$tag_name" "$TARBALL_NAME" ebpfdivert.bpf.o --title "Release $tag_name" --notes "Automated release for $tag_name"
 
