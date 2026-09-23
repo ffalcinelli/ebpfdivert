@@ -35,6 +35,7 @@ test_bpf
 # Linker output
 *.ilk
 *.map
+!src/libebpfdivert.map
 *.exp
 
 # Precompiled Headers
@@ -59,3 +60,5 @@ dkms.conf
 ebpfdivert-cli
 tracelog.txt
 test_integration
+test_filter
+build/

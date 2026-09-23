@@ -16,7 +16,12 @@
 #include <net/ethernet.h>
 #include <ifaddrs.h>
 #include <sys/mman.h>
+#include <sys/random.h>
+#include <sys/resource.h>
+#include <pthread.h>
 #include "ebpfdivert.h"
+#include "internal.h"
+#include "wd.h"
 
 #include <stdarg.h>
 
@@ -37,7 +42,7 @@ static int default_print_fn(enum ebpfdivert_print_level level, const char *forma
     return 0;
 }
 
-static int pr_log(enum ebpfdivert_print_level level, const char *format, ...) {
+int pr_log(enum ebpfdivert_print_level level, const char *format, ...) {
     va_list args;
     int err;
     va_start(args, format);
@@ -163,9 +168,10 @@ int ebpfdivert_load(const char *ifname, const char *obj_path, uint32_t priority)
         }
     }
 
-    struct bpf_object *obj = bpf_object__open_file(obj_path, NULL);
-    if (!obj) {
-        pr_err("ERROR: opening BPF object file '%s' failed\n", obj_path);
+    struct bpf_object *obj = (obj_path && *obj_path) ? bpf_object__open_file(obj_path, NULL)
+                                                     : embedded_object_open();
+    if (!obj || libbpf_get_error(obj)) {
+        pr_err("ERROR: opening BPF object '%s' failed\n", obj_path ? obj_path : "(embedded)");
         return -1;
     }
 
@@ -193,10 +199,13 @@ int ebpfdivert_load(const char *ifname, const char *obj_path, uint32_t priority)
     struct bpf_map *config_map = bpf_object__find_map_by_name(obj, "config_map");
     if (config_map) {
         __u32 key = 0;
+        int lo = (int)if_nametoindex("lo");
         struct divert_config config = {
             .priority = priority,
-            .snaplen = 2048,
-            .loop_prevention_mark = 0x4D490000
+            .snaplen = DIVERT_MAX_PACKET,
+            .loop_prevention_mark = LOOP_PREVENTION_MARK,
+            .lo_ifindex = (uint32_t)(lo > 0 ? lo : 1),
+            .flags = 0
         };
         int map_fd = bpf_map__fd(config_map);
         if (map_fd >= 0) {
@@ -1135,410 +1144,93 @@ int ebpfdivert_get_stats(uint64_t *stats, int stats_len) {
     return 0;
 }
 
-struct pkt_queue_entry {
-    struct divert_packet_buffer pkt;
-    size_t size;
-    struct pkt_queue_entry *next;
-};
+/****************************************************************************/
+/* Internal helpers                                                         */
+/****************************************************************************/
 
-struct if_sock_entry {
-    int ifindex;        // The interface bound to (lo or target)
-    int target_ifindex; // Destination target interface
-    int is_redirect;    // Flag indicating this is a redirect injection socket
-    int sock;
-    uint8_t *tx_ring;
-    uint32_t tx_index;
-};
+extern const unsigned char ebpfdivert_bpf_obj[];
+extern const unsigned char ebpfdivert_bpf_obj_end[];
+extern const unsigned char ebpfdivert_events_obj[];
+extern const unsigned char ebpfdivert_events_obj_end[];
 
-struct ebpfdivert_handle {
-    struct ring_buffer *rb;
-    int ringbuf_fd;
-    uint32_t priority;
-    
-    struct divert_packet_buffer *curr_buf;
-    size_t curr_buf_len;
-    int curr_received;
+static pthread_once_t setup_once = PTHREAD_ONCE_INIT;
 
-    struct pkt_queue_entry *queue_head;
-    struct pkt_queue_entry *queue_tail;
-    int queue_size;
-    int max_queue_size;
-
-    // Cache of interface-specific raw sockets for TX ring injection
-    struct if_sock_entry *socks;
-    int socks_count;
-    int socks_capacity;
-};
-
-static int ebpfdivert_rb_callback(void *ctx, void *data, size_t size) {
-    struct ebpfdivert_handle *h = ctx;
-    if (!h) return 0;
-    
-    if (!h->curr_received) {
-        size_t to_copy = (size < h->curr_buf_len) ? size : h->curr_buf_len;
-        memcpy(h->curr_buf, data, to_copy);
-        h->curr_received = 1;
-    } else {
-        if (h->queue_size >= h->max_queue_size) {
-            int stats_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/stats_map");
-            if (stats_fd >= 0) {
-                __u32 key = STAT_QUEUE_FULL;
-                int num_cpus = libbpf_num_possible_cpus();
-                __u64 values[num_cpus];
-                memset(values, 0, sizeof(values));
-                if (bpf_map_lookup_elem(stats_fd, &key, values) == 0) {
-                    values[0] += 1;
-                    bpf_map_update_elem(stats_fd, &key, values, BPF_ANY);
-                }
-                close(stats_fd);
-            }
-            return 0; // Drop packet (backpressure)
-        }
-        struct pkt_queue_entry *entry = malloc(sizeof(struct pkt_queue_entry));
-        if (entry) {
-            size_t to_copy = (size < sizeof(struct divert_packet_buffer)) ? size : sizeof(struct divert_packet_buffer);
-            memcpy(&entry->pkt, data, to_copy);
-            entry->size = size;
-            entry->next = NULL;
-            if (h->queue_tail) {
-                h->queue_tail->next = entry;
-                h->queue_tail = entry;
-            } else {
-                h->queue_head = entry;
-                h->queue_tail = entry;
-            }
-            h->queue_size++;
-        }
-    }
-    return 0;
+static void do_libbpf_setup(void) {
+    struct rlimit rl = {RLIM_INFINITY, RLIM_INFINITY};
+    libbpf_set_print(ebpfdivert_libbpf_print_fn);
+    /* Kernels before 5.11 charge BPF memory to RLIMIT_MEMLOCK. */
+    setrlimit(RLIMIT_MEMLOCK, &rl);
 }
 
-ebpfdivert_handle_t *ebpfdivert_open(uint32_t priority) {
-    struct ebpfdivert_handle *h = calloc(1, sizeof(struct ebpfdivert_handle));
-    if (!h) return NULL;
-    
-    h->priority = priority;
-    h->ringbuf_fd = -1;
-    h->queue_head = NULL;
-    h->queue_tail = NULL;
-    h->queue_size = 0;
-    h->max_queue_size = 1024; // Default max queue size
-    
-    h->ringbuf_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/pcap_ringbuf");
-    if (h->ringbuf_fd < 0) {
-        pr_err("ERROR: pcap_ringbuf map not found. Is the driver loaded?\n");
-        free(h);
+void ensure_libbpf_setup(void) {
+    pthread_once(&setup_once, do_libbpf_setup);
+}
+
+static struct bpf_object *open_embedded(const unsigned char *start, const unsigned char *end,
+                                        const char *name) {
+    DECLARE_LIBBPF_OPTS(bpf_object_open_opts, opts, .object_name = name);
+    struct bpf_object *obj;
+    ensure_libbpf_setup();
+    obj = bpf_object__open_mem(start, (size_t)(end - start), &opts);
+    if (!obj || libbpf_get_error(obj)) {
+        if (obj)
+            errno = (int)-libbpf_get_error(obj);
         return NULL;
     }
-    
-    h->rb = ring_buffer__new(h->ringbuf_fd, ebpfdivert_rb_callback, h, NULL);
-    if (!h->rb) {
-        pr_err("ERROR: failed to create ring buffer consumer\n");
-        close(h->ringbuf_fd);
-        free(h);
-        return NULL;
-    }
-    
-    h->socks_capacity = 16;
-    h->socks = calloc(h->socks_capacity, sizeof(struct if_sock_entry));
-    if (!h->socks) {
-        pr_err("ERROR: failed to allocate raw sockets cache\n");
-        ring_buffer__free(h->rb);
-        close(h->ringbuf_fd);
-        free(h);
-        return NULL;
-    }
-    h->socks_count = 0;
-    return h;
+    return obj;
 }
 
-int ebpfdivert_recv(ebpfdivert_handle_t *h, struct divert_packet_buffer *buf, size_t buf_len, int timeout_ms) {
-    if (!h || !buf) return -EINVAL;
-    
-    if (h->queue_head) {
-        struct pkt_queue_entry *entry = h->queue_head;
-        size_t to_copy = (entry->size < buf_len) ? entry->size : buf_len;
-        memcpy(buf, &entry->pkt, to_copy);
-        h->queue_head = entry->next;
-        if (!h->queue_head) {
-            h->queue_tail = NULL;
-        }
-        h->queue_size--;
-        free(entry);
-        return 0;
-    }
-    
-    h->curr_buf = buf;
-    h->curr_buf_len = buf_len;
-    h->curr_received = 0;
-    
-    int ret = ring_buffer__poll(h->rb, timeout_ms);
-    
-    h->curr_buf = NULL;
-    h->curr_buf_len = 0;
-    
-    if (h->curr_received) {
-        return 0;
-    }
-    
-    if (ret < 0) {
-        if (ret == -EINTR || ret == -1) {
-            if (h->curr_received) return 0;
-        }
-        return ret;
-    }
-    
-    return -EAGAIN;
+struct bpf_object *embedded_object_open(void) {
+    return open_embedded(ebpfdivert_bpf_obj, ebpfdivert_bpf_obj_end, "ebpfdivert");
 }
 
-int ebpfdivert_send(ebpfdivert_handle_t *h, const struct divert_packet_buffer *buf) {
-    if (!h || !buf) return -EINVAL;
-    
-    int ifindex = buf->header.ifindex;
-    if (ifindex <= 0) return -EINVAL;
-    
-    size_t to_send = buf->header.cap_len;
-    if (to_send > buf->header.pkt_len) {
-        to_send = buf->header.pkt_len;
-    }
-    if (to_send > 2048) {
-        to_send = 2048;
-    }
-    
-    int is_redirect = (buf->header.direction == 1);
-    int target_ifindex = ifindex;
-    int lo_idx = if_nametoindex("lo");
-    if (lo_idx <= 0) lo_idx = 1;
-    
-    int bind_ifindex = is_redirect ? lo_idx : target_ifindex;
-    if (target_ifindex == lo_idx) {
-        is_redirect = 1;
-        bind_ifindex = lo_idx;
-    }
-    
-    int sock_idx = -1;
-    for (int i = 0; i < h->socks_count; i++) {
-        if (h->socks[i].is_redirect == is_redirect && 
-            h->socks[i].target_ifindex == target_ifindex) {
-            sock_idx = i;
-            break;
-        }
-    }
-    
-    if (sock_idx == -1) {
-        if (h->socks_count >= h->socks_capacity) {
-            int new_capacity = h->socks_capacity * 2;
-            struct if_sock_entry *new_socks = realloc(h->socks, new_capacity * sizeof(struct if_sock_entry));
-            if (!new_socks) {
-                return -ENOMEM;
-            }
-            h->socks = new_socks;
-            memset(&h->socks[h->socks_capacity], 0, (new_capacity - h->socks_capacity) * sizeof(struct if_sock_entry));
-            h->socks_capacity = new_capacity;
-        }
-        int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-        if (sock < 0) {
-            return -errno;
-        }
-        
-        uint32_t mark;
-        if (is_redirect) {
-            mark = REDIRECT_MARK_MASK | (target_ifindex & 0xFFFF);
-        } else {
-            mark = 0x4D490000 | (h->priority & 0xFFFF);
-        }
-        
-        if (setsockopt(sock, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) < 0) {
-            close(sock);
-            return -errno;
-        }
-        
-        struct sockaddr_ll sll;
-        memset(&sll, 0, sizeof(sll));
-        sll.sll_family = AF_PACKET;
-        sll.sll_ifindex = bind_ifindex;
-        sll.sll_protocol = htons(ETH_P_ALL);
-        if (bind(sock, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
-            close(sock);
-            return -errno;
-        }
-        
-        sock_idx = h->socks_count;
-        h->socks[sock_idx].ifindex = bind_ifindex;
-        h->socks[sock_idx].target_ifindex = target_ifindex;
-        h->socks[sock_idx].is_redirect = is_redirect;
-        h->socks[sock_idx].sock = sock;
-        h->socks[sock_idx].tx_ring = NULL;
-        h->socks[sock_idx].tx_index = 0;
-        h->socks_count++;
-    }
-    
-    int sock = h->socks[sock_idx].sock;
-    ssize_t sent = send(sock, buf->data, to_send, 0);
-    if (sent < 0) {
-        return -errno;
-    }
-    
-    return 0;
+struct bpf_object *embedded_events_object_open(void) {
+    return open_embedded(ebpfdivert_events_obj, ebpfdivert_events_obj_end, "ebpfdivert_ev");
 }
 
-int ebpfdivert_set_max_queue_size(ebpfdivert_handle_t *h, int size) {
-    if (!h || size <= 0) return -EINVAL;
-    h->max_queue_size = size;
-    return 0;
+int getrandom_u64(uint64_t *out) {
+    ssize_t n = getrandom(out, sizeof(*out), 0);
+    return n == (ssize_t)sizeof(*out) ? 0 : -EIO;
 }
 
-void ebpfdivert_close(ebpfdivert_handle_t *h) {
-    if (!h) return;
-    for (int i = 0; i < h->socks_count; i++) {
-        if (h->socks[i].tx_ring) {
-            munmap(h->socks[i].tx_ring, 16384 * 8);
-        }
-        close(h->socks[i].sock);
-    }
-    free(h->socks);
-    
-    // Free the packet queue
-    struct pkt_queue_entry *curr = h->queue_head;
-    while (curr) {
-        struct pkt_queue_entry *next = curr->next;
-        free(curr);
-        curr = next;
-    }
-    
-    if (h->rb) {
-        ring_buffer__free(h->rb);
-    }
-    if (h->ringbuf_fd >= 0) {
-        close(h->ringbuf_fd);
-    }
-    free(h);
+const char *ebpfdivert_strerror(int err) {
+    static __thread char buf[128];
+    if (err < 0)
+        err = -err;
+    if (strerror_r(err, buf, sizeof(buf)) != 0)
+        snprintf(buf, sizeof(buf), "Unknown error %d", err);
+    return buf;
 }
 
-int ebpfdivert_get_fd(ebpfdivert_handle_t *h) {
-    if (!h) return -EINVAL;
-    return h->ringbuf_fd;
+/****************************************************************************/
+/* Helpers (WinDivertHelper* equivalents)                                   */
+/****************************************************************************/
+
+int ebpfdivert_helper_compile_filter(const char *filter, int layer, const char **err_str,
+                                     uint32_t *err_pos) {
+    struct wd_filter *f = NULL;
+    unsigned pos = 0;
+    int ret = wd_filter_compile(filter, layer, &f, err_str, &pos);
+    if (err_pos)
+        *err_pos = pos;
+    wd_filter_free(f);
+    return ret;
 }
 
-struct bpf_lpm_trie_key_u4 {
-    __u32 prefixlen;
-    __u32 ipv4_addr;
-};
-
-struct bpf_lpm_trie_key_u6 {
-    __u32 prefixlen;
-    __u8 ipv6_addr[16];
-};
-
-int ebpfdivert_add_subnet_rule(ebpfdivert_handle_t *h, const char *ip_cidr, uint32_t action_mask) {
-    if (!h || !ip_cidr) return -EINVAL;
-
-    char ip_str[64] = {0};
-    int prefixlen = -1;
-    const char *slash = strchr(ip_cidr, '/');
-    if (slash) {
-        size_t len = slash - ip_cidr;
-        if (len >= sizeof(ip_str)) return -EINVAL;
-        strncpy(ip_str, ip_cidr, len);
-        prefixlen = atoi(slash + 1);
-        if (prefixlen < 0) return -EINVAL;
-    } else {
-        if (strlen(ip_cidr) >= sizeof(ip_str)) return -EINVAL;
-        strcpy(ip_str, ip_cidr);
-    }
-
-    // Try IPv4 first
-    struct in_addr ipv4;
-    if (inet_pton(AF_INET, ip_str, &ipv4) == 1) {
-        if (prefixlen < 0) prefixlen = 32;
-        if (prefixlen > 32) return -EINVAL;
-
-        struct bpf_lpm_trie_key_u4 key = {
-            .prefixlen = prefixlen,
-            .ipv4_addr = ipv4.s_addr
-        };
-        int map_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/ipv4_lpm_trie");
-        if (map_fd < 0) return map_fd;
-
-        int ret = bpf_map_update_elem(map_fd, &key, &action_mask, BPF_ANY);
-        close(map_fd);
-        return ret;
-    }
-
-    // Try IPv6
-    struct in6_addr ipv6;
-    if (inet_pton(AF_INET6, ip_str, &ipv6) == 1) {
-        if (prefixlen < 0) prefixlen = 128;
-        if (prefixlen > 128) return -EINVAL;
-
-        struct bpf_lpm_trie_key_u6 key = {
-            .prefixlen = prefixlen
-        };
-        memcpy(key.ipv6_addr, &ipv6, 16);
-
-        int map_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/ipv6_lpm_trie");
-        if (map_fd < 0) return map_fd;
-
-        int ret = bpf_map_update_elem(map_fd, &key, &action_mask, BPF_ANY);
-        close(map_fd);
-        return ret;
-    }
-
-    return -EINVAL;
+int ebpfdivert_helper_eval_filter(const char *filter, const void *pkt, uint32_t pkt_len,
+                                  const struct ebpfdivert_address *addr) {
+    return wd_eval_filter_string(filter, pkt, pkt_len, addr);
 }
 
-int ebpfdivert_delete_subnet_rule(ebpfdivert_handle_t *h, const char *ip_cidr) {
-    if (!h || !ip_cidr) return -EINVAL;
-
-    char ip_str[64] = {0};
-    int prefixlen = -1;
-    const char *slash = strchr(ip_cidr, '/');
-    if (slash) {
-        size_t len = slash - ip_cidr;
-        if (len >= sizeof(ip_str)) return -EINVAL;
-        strncpy(ip_str, ip_cidr, len);
-        prefixlen = atoi(slash + 1);
-        if (prefixlen < 0) return -EINVAL;
-    } else {
-        if (strlen(ip_cidr) >= sizeof(ip_str)) return -EINVAL;
-        strcpy(ip_str, ip_cidr);
-    }
-
-    struct in_addr ipv4;
-    if (inet_pton(AF_INET, ip_str, &ipv4) == 1) {
-        if (prefixlen < 0) prefixlen = 32;
-        if (prefixlen > 32) return -EINVAL;
-
-        struct bpf_lpm_trie_key_u4 key = {
-            .prefixlen = prefixlen,
-            .ipv4_addr = ipv4.s_addr
-        };
-        int map_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/ipv4_lpm_trie");
-        if (map_fd < 0) return map_fd;
-
-        int ret = bpf_map_delete_elem(map_fd, &key);
-        close(map_fd);
-        return ret;
-    }
-
-    struct in6_addr ipv6;
-    if (inet_pton(AF_INET6, ip_str, &ipv6) == 1) {
-        if (prefixlen < 0) prefixlen = 128;
-        if (prefixlen > 128) return -EINVAL;
-
-        struct bpf_lpm_trie_key_u6 key = {
-            .prefixlen = prefixlen
-        };
-        memcpy(key.ipv6_addr, &ipv6, 16);
-
-        int map_fd = bpf_obj_get("/sys/fs/bpf/ebpfdivert/ipv6_lpm_trie");
-        if (map_fd < 0) return map_fd;
-
-        int ret = bpf_map_delete_elem(map_fd, &key);
-        close(map_fd);
-        return ret;
-    }
-
-    return -EINVAL;
+int ebpfdivert_helper_format_filter(const char *filter, int layer, char *buf, uint32_t buf_len) {
+    return wd_format_filter(filter, layer, buf, buf_len);
 }
 
+int ebpfdivert_helper_calc_checksums(void *pkt, uint32_t pkt_len, struct ebpfdivert_address *addr,
+                                     uint64_t flags) {
+    return wd_calc_checksums(pkt, pkt_len, addr, flags);
+}
+
+uint64_t ebpfdivert_helper_hash_packet(const void *pkt, uint32_t pkt_len, uint64_t seed) {
+    return wd_hash_packet(pkt, pkt_len, seed);
+}

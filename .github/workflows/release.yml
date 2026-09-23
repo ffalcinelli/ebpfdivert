@@ -10,41 +10,43 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev make gcc linux-headers-generic
+        with:
+          submodules: recursive
 
       - name: Verify Version Alignment
         run: make check-version
 
-      - name: Build and Package
+      - name: Build (manylinux_2_28) and package
         run: |
-          # Compile the project
-          make
-          
-          # Create a structured directory and install built files
+          # Built in a manylinux_2_28 container with libbpf, libelf, zstd and
+          # zlib linked in: lib/libebpfdivert.so only needs glibc >= 2.28 and
+          # can ship in manylinux wheels and jars.
           tag_name="${GITHUB_REF##*/}"
-          DIST_DIR="ebpfdivert-${tag_name}-linux-amd64"
-          make install DESTDIR="$(pwd)/$DIST_DIR" PREFIX=""
-          
-          # Include README and LICENSE
-          cp README.md LICENSE "$DIST_DIR/" || true
-          
-          # Compress the release package
+          DIST_DIR="ebpfdivert-${tag_name}-linux-${{ matrix.arch }}"
+          docker run --rm -v "$PWD":/src -w /src "quay.io/pypa/manylinux_2_28_$(uname -m)" \
+              bash -c "scripts/build_release.sh '$DIST_DIR' && chown -R $(id -u):$(id -g) /src"
+          sudo ./test_bpf ebpfdivert.bpf.o
           tar -czf "${DIST_DIR}.tar.gz" -C "$DIST_DIR" .
-          
-          # Export tarball filename for the next step
-          echo "TARBALL_NAME=${DIST_DIR}.tar.gz" >> $GITHUB_ENV
+          echo "TARBALL_NAME=${DIST_DIR}.tar.gz" >> "$GITHUB_ENV"
 
-      - name: Create Release
+      - name: Publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag_name="${GITHUB_REF##*/}"
-          gh release create "$tag_name" "$TARBALL_NAME" ebpfdivert.bpf.o --title "Release $tag_name" --notes "Automated release for $tag_name"
-
+          assets=("$TARBALL_NAME")
+          # The BPF object is architecture neutral: attach it once.
+          if [ "${{ matrix.arch }}" = "amd64" ]; then assets+=(ebpfdivert.bpf.o); fi
+          gh release create "$tag_name" "${assets[@]}" --title "Release $tag_name" \
+              --notes "Automated release for $tag_name" \
+            || gh release upload "$tag_name" "${assets[@]}" --clobber
