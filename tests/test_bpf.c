@@ -144,7 +144,13 @@ struct run_opts {
 static int run(int prog_fd, const uint8_t *frame, size_t len, const struct run_opts *ro,
                struct __sk_buff *ctx_out)
 {
-    struct __sk_buff ctx = {0}, out = {0};
+    /* The kernel fails with ENOSPC if ctx_out is smaller than its own
+     * __sk_buff, which outgrows old UAPI headers (e.g. manylinux_2_28). */
+    union {
+        struct __sk_buff skb;
+        uint8_t pad[1024];
+    } out = {0};
+    struct __sk_buff ctx = {0};
     int err;
     DECLARE_LIBBPF_OPTS(bpf_test_run_opts, topts,
         .data_in = frame,
@@ -167,7 +173,7 @@ static int run(int prog_fd, const uint8_t *frame, size_t len, const struct run_o
     }
     ring_buffer__consume(rb);
     if (ctx_out)
-        *ctx_out = out;
+        *ctx_out = out.skb;
     return (int)topts.retval;
 }
 
