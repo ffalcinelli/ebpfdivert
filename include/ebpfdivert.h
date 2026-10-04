@@ -2,7 +2,7 @@
 #ifndef EBPFDIVERT_H
 #define EBPFDIVERT_H
 
-#define EBPFDIVERT_VERSION "0.1.0"
+#define EBPFDIVERT_VERSION "0.0.5"
 
 #include <stdint.h>
 #include <stddef.h>

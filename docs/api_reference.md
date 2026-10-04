@@ -175,7 +175,7 @@ WinDivert's own code. None of them needs privileges.
 ```c
 typedef int (*ebpfdivert_print_fn_t)(enum ebpfdivert_print_level level, const char *fmt, va_list args);
 void ebpfdivert_set_print(ebpfdivert_print_fn_t fn);   /* also receives libbpf output; NULL silences */
-const char *ebpfdivert_version(void);                  /* "0.1.0" */
+const char *ebpfdivert_version(void);                  /* "0.0.5" */
 ```
 
 ## Differences from WinDivert
