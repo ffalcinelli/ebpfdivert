@@ -8,10 +8,13 @@
 void print_usage(const char *prog_name) {
     printf("Usage: %s <command> [args]\n", prog_name);
     printf("Commands:\n");
-    printf("  load [interface] [priority] [bpf_object_path]  Attach driver (defaults to 'all' interfaces, priority 0)\n");
+    printf("  sniff [filter] [pcap_file]          Sniff packets matching a WinDivert filter (Ctrl+C to stop)\n");
+    printf("  cleanup                             Detach programs left behind by crashed processes\n");
+    printf("\nPinned global mode:\n");
+    printf("  load [interface] [priority] [bpf_object_path]  Attach driver (defaults to 'all' interfaces, priority 0,\n");
+    printf("                                      embedded BPF object)\n");
     printf("  unload [interface]                  Detach driver (defaults to 'all' interfaces)\n");
     printf("  stats                               Print packet telemetry stats\n");
-    printf("  sniff [pcap_file]                   Sniff captured packets (Ctrl+C to stop)\n");
     printf("  rules list                          List all active rules\n");
     printf("  rules clear                         Clear all active rules\n");
     printf("  rules add <idx> <proto> <dst_ip/mask> <dst_port_range> <action>\n");
@@ -25,8 +28,8 @@ void print_usage(const char *prog_name) {
 }
 
 int cli_stats() {
-    uint64_t stats[6] = {0};
-    if (ebpfdivert_get_stats(stats, 6)) {
+    uint64_t stats[STAT_MAX] = {0};
+    if (ebpfdivert_get_stats(stats, STAT_MAX)) {
         fprintf(stderr, "ERROR: eBPFDivert stats map not found. Is the driver loaded?\n");
         return -1;
     }
@@ -37,19 +40,22 @@ int cli_stats() {
         "Sniffed",
         "Parsing Errors",
         "Ringbuf Full",
-        "Queue Full"
+        "Queue Full",
+        "Too Big",
+        "Owner Gone"
     };
 
     printf("eBPFDivert Statistics:\n");
     printf("Metric          | Value\n");
     printf("---------------------------\n");
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < STAT_MAX; i++) {
         printf("%-15s | %lu\n", stat_names[i], stats[i]);
     }
     return 0;
 }
 
-#include <sys/time.h>
+#include <signal.h>
+#include <time.h>
 
 struct pcap_hdr {
     uint32_t magic_number;
@@ -76,32 +82,47 @@ static void write_pcap_header(FILE *f) {
         .thiszone = 0,
         .sigfigs = 0,
         .snaplen = 65535,
-        .network = 1 // Ethernet
+        .network = 101 // LINKTYPE_RAW: packets start at the IP header
     };
     fwrite(&hdr, sizeof(hdr), 1, f);
 }
 
-static void write_pcap_packet(FILE *f, const struct divert_packet_buffer *buf) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    
+static void write_pcap_packet(FILE *f, const uint8_t *pkt, uint32_t len) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
     struct pcaprec_hdr phdr = {
-        .ts_sec = (uint32_t)tv.tv_sec,
-        .ts_usec = (uint32_t)tv.tv_usec,
-        .incl_len = buf->header.cap_len,
-        .orig_len = buf->header.pkt_len
+        .ts_sec = (uint32_t)ts.tv_sec,
+        .ts_usec = (uint32_t)(ts.tv_nsec / 1000),
+        .incl_len = len,
+        .orig_len = len
     };
     fwrite(&phdr, sizeof(phdr), 1, f);
-    fwrite(buf->data, phdr.incl_len, 1, f);
+    fwrite(pkt, len, 1, f);
 }
 
-int cli_sniff(const char *pcap_filename) {
-    ebpfdivert_handle_t *h = ebpfdivert_open(0);
+static volatile sig_atomic_t stop_sniffing;
+
+static void on_signal(int sig) {
+    (void)sig;
+    stop_sniffing = 1;
+}
+
+int cli_sniff(const char *filter, const char *pcap_filename) {
+    ebpfdivert_handle_t *h = ebpfdivert_open(filter, EBPFDIVERT_LAYER_NETWORK, 0,
+                                             EBPFDIVERT_FLAG_SNIFF | EBPFDIVERT_FLAG_RECV_ONLY, NULL);
     if (!h) {
-        fprintf(stderr, "ERROR: failed to open eBPFDivert handle. Is the driver loaded?\n");
+        int err = errno;
+        const char *err_str = NULL;
+        uint32_t err_pos = 0;
+        if (err == EINVAL &&
+            ebpfdivert_helper_compile_filter(filter, EBPFDIVERT_LAYER_NETWORK, &err_str, &err_pos) != 0) {
+            fprintf(stderr, "ERROR: invalid filter at position %u: %s\n", err_pos, err_str);
+        } else {
+            fprintf(stderr, "ERROR: failed to open eBPFDivert handle: %s\n", strerror(err));
+        }
         return -1;
     }
-    
+
     FILE *pcap_file = NULL;
     if (pcap_filename) {
         pcap_file = fopen(pcap_filename, "wb");
@@ -111,59 +132,59 @@ int cli_sniff(const char *pcap_filename) {
             return -1;
         }
         write_pcap_header(pcap_file);
-        printf("Sniffing packets to '%s'...\n", pcap_filename);
+        printf("Sniffing '%s' to '%s'...\n", filter, pcap_filename);
     } else {
-        printf("Sniffing packets to console...\n");
+        printf("Sniffing '%s' to console...\n", filter);
     }
-    
-    struct divert_packet_buffer buf;
-    while (1) {
-        int ret = ebpfdivert_recv(h, &buf, sizeof(buf), 100);
-        if (ret == 0) {
-            const char *dir_str = (buf.header.direction == 1) ? "INGRESS" : "EGRESS";
-            const char *proto_str = "UNKNOWN";
-            
-            uint8_t proto = 0;
-            if ((uint32_t)(buf.header.l2_len + 20) <= buf.header.pkt_len) {
-                uint8_t *l3 = buf.data + buf.header.l2_len;
-                uint8_t ver = l3[0] >> 4;
-                if (ver == 4) {
-                    proto = l3[9];
-                } else if (ver == 6) {
-                    proto = l3[6];
-                }
-            }
-            
-            if (proto == 6) proto_str = "TCP";
-            else if (proto == 17) proto_str = "UDP";
-            else if (proto == 1) proto_str = "ICMP";
-            else if (proto == 58) proto_str = "ICMPv6";
-            
-            printf("[%7s] IfIndex: %u, Len: %u, L2: %u, Proto: %s (%u)\n", 
-                   dir_str, buf.header.ifindex, buf.header.pkt_len, buf.header.l2_len, proto_str, proto);
-            
-            if (pcap_file) {
-                write_pcap_packet(pcap_file, &buf);
-                fflush(pcap_file);
-            }
-        } else if (ret == -EAGAIN) {
+
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    static uint8_t pkt[EBPFDIVERT_MTU_MAX];
+    struct ebpfdivert_address addr;
+    uint32_t len;
+    int ret = 0;
+    while (!stop_sniffing) {
+        int r = ebpfdivert_recv(h, pkt, sizeof(pkt), &len, &addr, 200);
+        if (r == -EAGAIN || r == -EINTR) {
             continue;
-        } else if (ret == -EINTR || ret == -2) {
-            continue;
-        } else {
-            fprintf(stderr, "ERROR: receiving packet failed: %s\n", strerror(-ret));
+        } else if (r < 0) {
+            fprintf(stderr, "ERROR: receiving packet failed: %s\n", ebpfdivert_strerror(r));
+            ret = -1;
             break;
         }
+
+        const char *proto_str = "UNKNOWN";
+        uint8_t proto = 0;
+        if (len >= 20) {
+            proto = addr.ipv6 ? pkt[6] : pkt[9];
+        }
+        if (proto == 6) proto_str = "TCP";
+        else if (proto == 17) proto_str = "UDP";
+        else if (proto == 1) proto_str = "ICMP";
+        else if (proto == 58) proto_str = "ICMPv6";
+
+        printf("[%8s%s] IfIndex: %u, Len: %u, Proto: %s (%u)\n",
+               addr.outbound ? "OUTBOUND" : "INBOUND", addr.loopback ? ",LO" : "",
+               addr.network.if_idx, len, proto_str, proto);
+
+        if (pcap_file) {
+            write_pcap_packet(pcap_file, pkt, len);
+            fflush(pcap_file);
+        }
     }
-    
+
     if (pcap_file) {
         fclose(pcap_file);
     }
     ebpfdivert_close(h);
-    return 0;
+    return ret;
 }
 
 int cli_print_fn(enum ebpfdivert_print_level level, const char *format, va_list args) {
+    if (level > EBPFDIVERT_INFO) {
+        return 0;
+    }
     if (level <= EBPFDIVERT_WARN) {
         return vfprintf(stderr, format, args);
     } else {
@@ -188,7 +209,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "load") == 0) {
         const char *ifname = NULL;
         uint32_t priority = 0;
-        const char *obj_path = "ebpfdivert.bpf.o";
+        const char *obj_path = NULL;
 
         if (argc >= 3) {
             const char *arg = argv[2];
@@ -232,8 +253,11 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "stats") == 0) {
         return cli_stats() ? 1 : 0;
     } else if (strcmp(cmd, "sniff") == 0) {
-        const char *pcap_filename = (argc >= 3) ? argv[2] : NULL;
-        return cli_sniff(pcap_filename) ? 1 : 0;
+        const char *filter = (argc >= 3) ? argv[2] : "true";
+        const char *pcap_filename = (argc >= 4) ? argv[3] : NULL;
+        return cli_sniff(filter, pcap_filename) ? 1 : 0;
+    } else if (strcmp(cmd, "cleanup") == 0) {
+        return ebpfdivert_unregister() ? 1 : 0;
     } else if (strcmp(cmd, "rules") == 0) {
         if (argc < 3) {
             fprintf(stderr, "Usage: %s rules <list|clear|add|add-ext> [args]\n", argv[0]);

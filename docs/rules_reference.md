@@ -1,6 +1,13 @@
-# eBPFDivert Filtering Rules Reference
+# eBPFDivert kernel rules reference
 
-`ebpfdivert` uses a structured kernel-side rule engine stored in BPF maps. Users configure filtering rules to determine which packets are intercepted, dropped, or sniffed.
+The BPF program matches packets against a table of up to 64 conjunctive rules per address family
+(`MAX_RULES`), in index order; the first matching rule decides the action.
+
+- **Handles** (`ebpfdivert_open`) never expose this table. The library fills it by lowering the WinDivert filter
+  (`src/prefilter.c`). When the lowering is not exact, the library evaluates the full filter in user space. See
+  [architecture.md](architecture.md).
+- **Pinned global mode** (`ebpfdivert-cli load` / `rules`) lets you write the table directly. Its maps are pinned
+  under `/sys/fs/bpf/ebpfdivert/`. This document describes that table.
 
 ---
 
@@ -61,9 +68,10 @@ Each bit in the `match_mask` specifies whether the driver should evaluate that c
 | `MATCH_DST_PORT` | `1 << 3` | Verify destination port range (or ICMP code). |
 | `MATCH_PROTO` | `1 << 4` | Verify protocol (IP/NextHeader number). |
 | `MATCH_DIRECTION` | `1 << 5` | Verify direction (1=ingress, 2=egress). |
-| `MATCH_LOOPBACK` | `1 << 6` | Verify loopback status (interface index 1). |
+| `MATCH_LOOPBACK` | `1 << 6` | Verify loopback status (packet on the loopback interface). |
 | `MATCH_TTL` | `1 << 11` | Verify TTL / Hop Limit. |
 | `MATCH_TCP_FLAGS` | `1 << 12` | Verify TCP flags. |
+| `MATCH_LPM_TRIE` | `1 << 13` | Match source/destination addresses against the `ipv4_lpm_trie`/`ipv6_lpm_trie` maps instead of the rule's address/mask. |
 
 ---
 
@@ -92,9 +100,11 @@ An action is defined by setting the corresponding action bit in the `match_mask`
 
 ## 5. Command-Line Examples
 
-Use the `ebpfdivert-cli` rules utility to configure the BPF maps:
+Load the pinned program, then configure its rules with `ebpfdivert-cli`:
 
 ```bash
+sudo ./ebpfdivert-cli load all        # embedded BPF object, all interfaces
+
 # Sniff (monitor) all inbound TCP port 80 traffic
 sudo ./ebpfdivert-cli rules add-ext 0 sniff --proto tcp --dst-port 80 --direction ingress
 
@@ -103,4 +113,7 @@ sudo ./ebpfdivert-cli rules add-ext 1 drop --proto udp --dst-port 53 --direction
 
 # Divert any packets with TCP SYN flag set
 sudo ./ebpfdivert-cli rules add-ext 2 divert --proto tcp --tcp-flags SYN --tcp-flags-mask SYN
+
+sudo ./ebpfdivert-cli stats
+sudo ./ebpfdivert-cli unload all
 ```

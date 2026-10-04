@@ -9,6 +9,17 @@
 #define TC_ACT_SHOT    2
 #define TC_ACT_STOLEN  4
 
+#define DIR_INGRESS    1
+#define DIR_EGRESS     2
+
+#define PACKET_HOST    0
+
+#define ETH_P_IP       0x0800
+#define ETH_P_IPV6     0x86DD
+
+#define AF_INET        2
+#define AF_INET6       10
+
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 24);
@@ -56,7 +67,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 6);
+    __uint(max_entries, STAT_MAX);
     __type(key, __u32);
     __type(value, __u64);
 } stats_map SEC(".maps");
@@ -68,7 +79,6 @@ struct {
     __type(value, struct divert_config);
 } config_map SEC(".maps");
 
-const volatile __u32 default_snaplen = 2048;
 
 static __always_inline void increment_stat(__u32 key) {
     __u64 *val = bpf_map_lookup_elem(&stats_map, &key);
@@ -97,13 +107,14 @@ struct parsed_packet {
     __u8  ttl;
     __u8  tcp_flags;
     __u8  parsed_ok;
+    __u8  fragment;
+    __u8  is_lo;
 };
 
 static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_packet *pkt) {
     void *data_end = (void *)(long)skb->data_end;
     void *data = (void *)(long)skb->data;
 
-    bpf_printk("parse_packet: len=%d, proto=%x, data_len=%d", skb->len, bpf_ntohs(skb->protocol), (int)(data_end - data));
 
     __u16 l2_len = 0;
     int found = 0;
@@ -112,8 +123,6 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
     // 1. Try Ethernet (14 bytes)
     if (data + 14 <= data_end) {
         __u16 ethertype = bpf_ntohs(*(__u16 *)((char *)data + 12));
-        bpf_printk("  14B check: %02x %02x %02x %02x ... ethertype=%x", 
-                   *(__u8 *)data, *((__u8 *)data+1), *((__u8 *)data+2), *((__u8 *)data+3), ethertype);
         if (ethertype == 0x0800 || ethertype == 0x86DD) {
             l2_len = 14;
             found = 1;
@@ -188,9 +197,16 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
             return 0;
         }
 
+        __u16 frag_off = bpf_ntohs(ip->frag_off);
+        if (frag_off & 0x3FFF) {
+            pkt->fragment = 1;
+        }
+
         void *transport_ptr = (char *)l3_ptr + (ihl * 4);
 
-        if (pkt->proto == 6) { // TCP
+        if (frag_off & 0x1FFF) {
+            // Non-first fragment: no transport header.
+        } else if (pkt->proto == 6) { // TCP
             struct tcphdr *tcp = transport_ptr;
             if ((void *)(tcp + 1) <= data_end) {
                 pkt->src_port = bpf_ntohs(tcp->source);
@@ -244,6 +260,7 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
 
             __u32 hdr_len = 0;
             if (nexthdr == IPPROTO_FRAGMENT) {
+                pkt->fragment = 1;
                 hdr_len = 8;
             } else {
                 hdr_len = ((*((__u8 *)transport_ptr + 1)) + 1) << 3;
@@ -260,7 +277,10 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
         }
         pkt->proto = nexthdr;
 
-        if (pkt->proto == 6) { // TCP
+        if (pkt->fragment) {
+            // Transport ports are only meaningful in the first fragment;
+            // like WinDivert, fragments carry no transport header.
+        } else if (pkt->proto == 6) { // TCP
             struct tcphdr *tcp = transport_ptr;
             if ((void *)(tcp + 1) <= data_end) {
                 pkt->src_port = bpf_ntohs(tcp->source);
@@ -286,8 +306,6 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct parsed_pac
     }
 
     pkt->parsed_ok = 1;
-    bpf_printk("parse_packet parsed: ver=%d proto=%d src=%x dst=%x sport=%d dport=%d ok=%d",
-               pkt->ver, pkt->proto, pkt->src_ip, pkt->dst_ip, pkt->src_port, pkt->dst_port, pkt->parsed_ok);
     return 1;
 }
 
@@ -295,12 +313,7 @@ static __always_inline int matches_rule_ipv4(struct parsed_packet *pkt, struct f
     if (!(rule->match_mask & MATCH_ENABLED)) return 0;
     if (rule->match_mask & MATCH_FALSE) return 0;
 
-    if (!pkt->parsed_ok) {
-        if (rule->match_mask == MATCH_ENABLED) return 1;
-        return 0;
-    }
-
-    if (pkt->ver != 4) return 0;
+    if (!pkt->parsed_ok || pkt->ver != 4) return 0;
 
     if (rule->match_mask & MATCH_LPM_TRIE) {
         if (rule->match_mask & MATCH_SRC_IP) {
@@ -336,12 +349,9 @@ static __always_inline int matches_rule_ipv4(struct parsed_packet *pkt, struct f
     if ((rule->match_mask & MATCH_PROTO) && ((pkt->proto == rule->proto) == !!(rule->invert_mask & MATCH_PROTO))) return 0;
     if ((rule->match_mask & MATCH_DIRECTION) && ((direction == rule->direction) == !!(rule->invert_mask & MATCH_DIRECTION))) return 0;
     if ((rule->match_mask & MATCH_TTL) && ((pkt->ttl == rule->ttl) == !!(rule->invert_mask & MATCH_TTL))) return 0;
-    if ((rule->match_mask & MATCH_TCP_FLAGS) && (pkt->tcp_flags & rule->tcp_flags_mask) != rule->tcp_flags) return 0;
+    if ((rule->match_mask & MATCH_TCP_FLAGS) && (((pkt->tcp_flags & rule->tcp_flags_mask) == rule->tcp_flags) == !!(rule->invert_mask & MATCH_TCP_FLAGS))) return 0;
 
-    if (rule->match_mask & MATCH_LOOPBACK) {
-        int is_lo = (pkt->ifindex == 1);
-        if (is_lo != rule->loopback) return 0;
-    }
+    if ((rule->match_mask & MATCH_LOOPBACK) && pkt->is_lo != rule->loopback) return 0;
 
     return 1;
 }
@@ -350,12 +360,7 @@ static __always_inline int matches_rule_ipv6(struct parsed_packet *pkt, struct f
     if (!(rule->match_mask & MATCH_ENABLED)) return 0;
     if (rule->match_mask & MATCH_FALSE) return 0;
 
-    if (!pkt->parsed_ok) {
-        if (rule->match_mask == MATCH_ENABLED) return 1;
-        return 0;
-    }
-
-    if (pkt->ver != 6) return 0;
+    if (!pkt->parsed_ok || pkt->ver != 6) return 0;
 
     if (rule->match_mask & MATCH_LPM_TRIE) {
         if (rule->match_mask & MATCH_SRC_IP) {
@@ -397,33 +402,189 @@ static __always_inline int matches_rule_ipv6(struct parsed_packet *pkt, struct f
     if ((rule->match_mask & MATCH_PROTO) && ((pkt->proto == rule->proto) == !!(rule->invert_mask & MATCH_PROTO))) return 0;
     if ((rule->match_mask & MATCH_DIRECTION) && ((direction == rule->direction) == !!(rule->invert_mask & MATCH_DIRECTION))) return 0;
     if ((rule->match_mask & MATCH_TTL) && ((pkt->ttl == rule->ttl) == !!(rule->invert_mask & MATCH_TTL))) return 0;
-    if ((rule->match_mask & MATCH_TCP_FLAGS) && (pkt->tcp_flags & rule->tcp_flags_mask) != rule->tcp_flags) return 0;
+    if ((rule->match_mask & MATCH_TCP_FLAGS) && (((pkt->tcp_flags & rule->tcp_flags_mask) == rule->tcp_flags) == !!(rule->invert_mask & MATCH_TCP_FLAGS))) return 0;
 
-    if (rule->match_mask & MATCH_LOOPBACK) {
-        int is_lo = (pkt->ifindex == 1);
-        if (is_lo != rule->loopback) return 0;
-    }
+    if ((rule->match_mask & MATCH_LOOPBACK) && pkt->is_lo != rule->loopback) return 0;
 
     return 1;
 }
 
-static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction) {
+/*
+ * Per-rule matching lives in global functions: the verifier checks each once
+ * instead of once per loop iteration and path, which keeps the 64-rule loops
+ * within the complexity limit of older kernels.  Global functions only take
+ * scalars, so the parsed packet travels through a per-CPU scratch map.
+ */
+struct match_scratch {
+    struct parsed_packet pkt;
+    __u32 direction;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct match_scratch);
+} scratch_map SEC(".maps");
+
+/* Returns the rule's match_mask if rule idx matches, 0 if not, -1 past the end. */
+__attribute__((noinline)) int match_rule_v4(__u32 idx)
+{
+    __u32 k0 = 0;
+    struct match_scratch *s = bpf_map_lookup_elem(&scratch_map, &k0);
+    struct filter_rule *rule = bpf_map_lookup_elem(&filter_rules, &idx);
+    if (!s || !rule || rule->match_mask == 0)
+        return -1;
+    return matches_rule_ipv4(&s->pkt, rule, (__u8)s->direction) ? rule->match_mask : 0;
+}
+
+__attribute__((noinline)) int match_rule_v6(__u32 idx)
+{
+    __u32 k0 = 0;
+    struct match_scratch *s = bpf_map_lookup_elem(&scratch_map, &k0);
+    struct filter_rule_ipv6 *rule = bpf_map_lookup_elem(&filter_rules_ipv6, &idx);
+    if (!s || !rule || rule->match_mask == 0)
+        return -1;
+    return matches_rule_ipv6(&s->pkt, rule, (__u8)s->direction) ? rule->match_mask : 0;
+}
+
+/*
+ * Is an ingress packet going to be forwarded rather than delivered locally?
+ * Only consulted when IP forwarding is enabled (CFG_F_FWD_CHECK).
+ */
+static __always_inline int is_forwarded(struct __sk_buff *skb, struct parsed_packet *pkt) {
+    struct bpf_fib_lookup params = {0};
+    params.ifindex = skb->ifindex;
+    params.l4_protocol = pkt->proto;
+    params.sport = bpf_htons(pkt->src_port);
+    params.dport = bpf_htons(pkt->dst_port);
+    if (pkt->ver == 4) {
+        params.family = AF_INET;
+        params.ipv4_src = bpf_htonl(pkt->src_ip);
+        params.ipv4_dst = bpf_htonl(pkt->dst_ip);
+    } else {
+        params.family = AF_INET6;
+        __builtin_memcpy(params.ipv6_src, pkt->src_ip6, 16);
+        __builtin_memcpy(params.ipv6_dst, pkt->dst_ip6, 16);
+    }
+    long ret = bpf_fib_lookup(skb, &params, sizeof(params), 0);
+    return ret == BPF_FIB_LKUP_RET_SUCCESS || ret == BPF_FIB_LKUP_RET_NO_NEIGH ||
+           ret == BPF_FIB_LKUP_RET_FRAG_NEEDED;
+}
+
+/*
+ * Copy the packet into the ring buffer.  bpf_ringbuf_reserve() needs a
+ * constant size, so records come in three size classes.
+ */
+#define EMIT_CLASS(SIZE)                                                            \
+    do {                                                                            \
+        struct divert_packet_buffer *buf =                                         \
+            bpf_ringbuf_reserve(&pcap_ringbuf, sizeof(struct divert_pkt_header) + (SIZE), 0); \
+        if (!buf) {                                                                 \
+            increment_stat(STAT_RINGBUF_FULL);                                      \
+            return -1;                                                              \
+        }                                                                           \
+        /* len is in [1, SIZE]; prove it with instructions no compiler can      \
+         * rewrite and every verifier tracks: n = ((len - 1) & (SIZE - 1)) + 1. */ \
+        __u64 n = len;                                                              \
+        asm volatile("%[n] += -1\n\t%[n] &= %[m]\n\t%[n] += 1"                      \
+                     : [n] "+r"(n) : [m] "i"((SIZE) - 1));                          \
+        if (bpf_skb_load_bytes(skb, 0, buf->data, n) < 0) {                         \
+            bpf_ringbuf_discard(buf, 0);                                            \
+            increment_stat(STAT_PARSING_ERR);                                       \
+            return -1;                                                              \
+        }                                                                           \
+        buf->header.pkt_len = meta->len;                                            \
+        buf->header.ifindex = meta->ifindex;                                        \
+        buf->header.direction = direction;                                          \
+        buf->header.l2_len = pkt->l2_len;                                           \
+        buf->header.cap_len = (__u32)n;                                             \
+        buf->header.timestamp = bpf_ktime_get_ns();                                 \
+        buf->header.ingress_ifindex = meta->ingress_ifindex;                        \
+        buf->header.gso_size = (__u16)meta->gso_size;                               \
+        buf->header.gso_segs = (__u16)meta->gso_segs;                               \
+        buf->header.flags = flags;                                                  \
+        buf->header.reserved = 0;                                                   \
+        buf->header.reserved2 = 0;                                                  \
+        bpf_ringbuf_submit(buf, 0);                                                 \
+        return 0;                                                                   \
+    } while (0)
+
+/* __sk_buff fields copied into the record; read up front because the
+ * verifier only allows context loads at constant offsets. */
+struct skb_meta {
+    __u32 len;
+    __u32 ifindex;
+    __u32 ingress_ifindex;
+    __u32 gso_size;
+    __u32 gso_segs;
+};
+
+static __always_inline int emit_packet(struct __sk_buff *skb, struct parsed_packet *pkt,
+                                       __u16 direction, __u16 flags, __u32 len) {
+    struct skb_meta m;
+    struct skb_meta *meta = &m;
+    m.len = skb->len;
+    m.ifindex = skb->ifindex;
+    m.ingress_ifindex = skb->ingress_ifindex;
+    m.gso_size = skb->gso_size;
+    m.gso_segs = skb->gso_segs;
+    barrier_var(meta);
+
+    if (len <= 2048) {
+        EMIT_CLASS(2048);
+    } else if (len <= 16384) {
+        EMIT_CLASS(16384);
+    } else {
+        EMIT_CLASS(DIVERT_MAX_PACKET);
+    }
+}
+
+static __always_inline int process_packet(struct __sk_buff *skb, __u16 direction) {
     __u32 key = 0;
     struct divert_config *cfg = bpf_map_lookup_elem(&config_map, &key);
-    __u32 my_prio = cfg ? cfg->priority : 0;
-    __u32 prevent_mark = (cfg && cfg->loop_prevention_mark) ? cfg->loop_prevention_mark : 0x4D490000;
-    __u32 snap = (cfg && cfg->snaplen) ? cfg->snaplen : default_snaplen;
+    if (!cfg || (cfg->flags & CFG_F_SHUTDOWN)) return TC_ACT_UNSPEC;
 
-    // LOOP_PREVENTION_MARK mask: prevent_mark | priority
+    /* Fail open when the owning process stopped refreshing its heartbeat. */
+    __u64 hb_timeout = cfg->heartbeat_timeout_ns;
+    if (hb_timeout && bpf_ktime_get_ns() - cfg->heartbeat_ns > hb_timeout) {
+        increment_stat(STAT_OWNER_GONE);
+        return TC_ACT_UNSPEC;
+    }
+
+    __u32 my_prio = cfg->priority;
+    __u32 prevent_mark = cfg->loop_prevention_mark ? cfg->loop_prevention_mark : LOOP_PREVENTION_MARK;
+    __u16 flags = 0;
+
     if ((skb->mark & 0xFFFF0000) == (prevent_mark & 0xFFFF0000)) {
         __u16 inject_prio = skb->mark & 0xFFFF;
-        // Ignore if we injected it, or if our priority is higher/equal (lower/equal integer)
-        // than the injector's priority. This allows lower priority handles (higher integer)
-        // to see reinjected packets.
+        // Handles with the same or a higher priority (lower or equal TC
+        // priority) than the injector ignore the packet; lower-priority
+        // handles see it as an impostor.
         if (my_prio <= inject_prio) return TC_ACT_UNSPEC;
+        flags |= PKT_F_IMPOSTOR;
     }
 
     if ((skb->mark & 0xFFFF0000) == REDIRECT_MARK_MASK) {
+        return TC_ACT_UNSPEC;
+    }
+
+    int is_lo = (skb->ifindex == cfg->lo_ifindex);
+    // Loopback traffic crosses lo egress and then lo ingress; like WinDivert,
+    // only report it once, as outbound.
+    if (is_lo && direction == DIR_INGRESS) return TC_ACT_UNSPEC;
+    if (is_lo && (cfg->flags & CFG_F_SKIP_LO)) return TC_ACT_UNSPEC;
+    if (is_lo) flags |= PKT_F_LOOPBACK;
+
+    if (direction == DIR_INGRESS && (cfg->flags & CFG_F_NO_INBOUND)) return TC_ACT_UNSPEC;
+    if (direction == DIR_EGRESS && (cfg->flags & CFG_F_NO_OUTBOUND)) return TC_ACT_UNSPEC;
+
+    int forward_layer = !!(cfg->flags & CFG_F_FORWARD);
+    if (direction == DIR_EGRESS) {
+        int forwarded = !is_lo && skb->ingress_ifindex != 0;
+        if (forwarded != forward_layer) return TC_ACT_UNSPEC;
+        if (forwarded) flags |= PKT_F_FORWARD;
+    } else if (forward_layer) {
         return TC_ACT_UNSPEC;
     }
 
@@ -438,33 +599,53 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
 
     struct parsed_packet pkt = {0};
     if (!parse_packet(skb, &pkt)) {
-        increment_stat(STAT_PARSING_ERR);
+        // Not IPv4/IPv6 (ARP, LLDP, ...): WinDivert never sees these.
+        return TC_ACT_UNSPEC;
+    }
+    pkt.is_lo = is_lo;
+
+    if (pkt.fragment) {
+        flags |= PKT_F_FRAGMENT;
+        if (direction == DIR_INGRESS && !(cfg->flags & CFG_F_FRAGMENTS)) return TC_ACT_UNSPEC;
+    }
+
+    if (direction == DIR_INGRESS && (cfg->flags & CFG_F_FWD_CHECK) && is_forwarded(skb, &pkt)) {
+        return TC_ACT_UNSPEC;
     }
 
     int matched = 0;
     __u16 match_mask = 0;
 
-    // 1. Process IPv4/Generic rules
-    for (__u32 i = 0; i < MAX_RULES; i++) {
-        __u32 k = i;
-        struct filter_rule *rule = bpf_map_lookup_elem(&filter_rules, &k);
-        if (!rule || rule->match_mask == 0) break;
-        if (matches_rule_ipv4(&pkt, rule, direction)) {
-            matched = 1;
-            match_mask = rule->match_mask;
-            break;
-        }
-    }
-
-    // 2. Process IPv6-specific rules (if packet is IPv6 and no generic rule matched)
-    if (!matched && pkt.parsed_ok && pkt.ver == 6) {
-        for (__u32 i = 0; i < MAX_RULES; i++) {
-            __u32 k = i;
+    if (pkt.fragment) {
+        /*
+         * Fragments carry no (or partial) transport headers, so the rules
+         * cannot judge them.  Hand them to user space, which evaluates the
+         * exact filter, whenever the filter can match anything at all.
+         */
+        __u32 k = 0;
+        __u16 mm = 0;
+        if (pkt.ver == 4) {
+            struct filter_rule *rule = bpf_map_lookup_elem(&filter_rules, &k);
+            if (rule) mm = rule->match_mask;
+        } else {
             struct filter_rule_ipv6 *rule = bpf_map_lookup_elem(&filter_rules_ipv6, &k);
-            if (!rule || rule->match_mask == 0) break;
-            if (matches_rule_ipv6(&pkt, rule, direction)) {
+            if (rule) mm = rule->match_mask;
+        }
+        if (!(mm & MATCH_ENABLED) || (mm & MATCH_FALSE)) return TC_ACT_UNSPEC;
+        matched = 1;
+        match_mask = mm & ~MATCH_DROP;
+    } else {
+        __u32 k0 = 0;
+        struct match_scratch *scratch = bpf_map_lookup_elem(&scratch_map, &k0);
+        if (!scratch) return TC_ACT_UNSPEC;
+        __builtin_memcpy(&scratch->pkt, &pkt, sizeof(pkt));
+        scratch->direction = direction;
+        for (__u32 i = 0; i < MAX_RULES; i++) {
+            int m = (pkt.ver == 4) ? match_rule_v4(i) : match_rule_v6(i);
+            if (m < 0) break;
+            if (m > 0) {
                 matched = 1;
-                match_mask = rule->match_mask;
+                match_mask = (__u16)m;
                 break;
             }
         }
@@ -477,35 +658,25 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
         return TC_ACT_SHOT;
     }
 
-    struct divert_packet_buffer *buf = bpf_ringbuf_reserve(&pcap_ringbuf, sizeof(struct divert_packet_buffer), 0);
-    if (!buf) {
-        increment_stat(STAT_RINGBUF_FULL);
+    int sniff = !!(match_mask & MATCH_SNIFF);
+    __u32 len = skb->len;
+    __u32 snap = cfg->snaplen ? cfg->snaplen : DIVERT_MAX_PACKET;
+    if (snap > DIVERT_MAX_PACKET) snap = DIVERT_MAX_PACKET;
+    if (len > snap) {
+        // A diverted packet must be copied whole or it cannot be re-injected.
+        if (!sniff) {
+            increment_stat(STAT_TOO_BIG);
+            return TC_ACT_UNSPEC;
+        }
+        len = snap;
+    }
+    if (sniff) flags |= PKT_F_SNIFFED;
+
+    if (emit_packet(skb, &pkt, direction, flags, len) < 0) {
         return TC_ACT_UNSPEC;
     }
 
-    buf->header.pkt_len = skb->len;
-    buf->header.ifindex = skb->ifindex;
-    buf->header.direction = (__u16)direction;
-    buf->header.l2_len = pkt.parsed_ok ? pkt.l2_len : 0;
-
-    __u32 to_load = skb->len;
-    __u32 max_len = snap;
-    if (max_len > 2048) max_len = 2048;
-    if (to_load > max_len) to_load = max_len;
-
-    buf->header.cap_len = to_load;
-    if (to_load > 0) {
-        int ret = bpf_skb_load_bytes(skb, 0, buf->data, ((to_load - 1) & 0x7FF) + 1);
-        if (ret < 0) {
-            bpf_ringbuf_discard(buf, 0);
-            increment_stat(STAT_PARSING_ERR);
-            return TC_ACT_UNSPEC;
-        }
-    }
-
-    bpf_ringbuf_submit(buf, 0);
-
-    if (match_mask & MATCH_SNIFF) {
+    if (sniff) {
         increment_stat(STAT_SNIFFED);
         return TC_ACT_UNSPEC;
     }
@@ -516,23 +687,30 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
 
 SEC("classifier")
 int tc_divert_ingress(struct __sk_buff *skb) {
-    if ((skb->mark & 0xFFFF0000) == REDIRECT_MARK_MASK) {
-        __u32 target_ifindex = skb->mark & 0xFFFF;
-        bpf_printk("tc_divert_ingress redirect: ifindex=%u target=%u pkt_type=%u", skb->ifindex, target_ifindex, skb->pkt_type);
-        if (skb->ifindex == target_ifindex) {
-            skb->mark = 0;
-            int ret = bpf_skb_change_type(skb, 0); // 0 is PACKET_HOST
-            bpf_printk("  bpf_skb_change_type ret=%d new pkt_type=%u", ret, skb->pkt_type);
-            return TC_ACT_UNSPEC;
-        }
+    __u32 mark = skb->mark;
+    if ((mark & 0xFFFF0000) == REDIRECT_MARK_MASK) {
+        /* Inbound injection sent through lo: hand it to the target.  The
+         * redirect clears skb->priority, so move the injector's priority
+         * into the mark first. */
+        __u32 target_ifindex = mark & 0xFFFF;
+        __u32 prio = skb->priority;
+        prio = ((prio & 0xFFFF0000) == REDIRECT_PRIO_MAGIC) ? (prio & 0xFFFF) : 0;
+        skb->mark = REDIRECTED_MARK | prio;
+        skb->priority = 0;
         return bpf_redirect(target_ifindex, BPF_F_INGRESS);
     }
-    return process_packet(skb, 1);
+    if ((mark & 0xFFFF0000) == REDIRECTED_MARK) {
+        /* Arrived on the target: the injector and higher-priority handles
+         * must skip it, lower-priority ones see an impostor. */
+        skb->mark = LOOP_PREVENTION_MARK | (mark & 0xFFFF);
+        bpf_skb_change_type(skb, PACKET_HOST);
+    }
+    return process_packet(skb, DIR_INGRESS);
 }
 
 SEC("classifier")
 int tc_divert_egress(struct __sk_buff *skb) {
-    return process_packet(skb, 2);
+    return process_packet(skb, DIR_EGRESS);
 }
 
 char _license[] SEC("license") = "GPL";

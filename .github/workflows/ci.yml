@@ -19,14 +19,19 @@ jobs:
         uses: ffalcinelli/pinner/action@dff77e1d17140dc88eb827aa7d833f995796b92b # v0.0.11
 
   build-and-test:
-    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        runner: [ ubuntu-24.04, ubuntu-24.04-arm ]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev make gcc linux-headers-generic
+          sudo apt-get install -y clang llvm make gcc pkg-config libelf-dev zlib1g-dev ethtool iproute2
 
       - name: Check BTF support
         run: |
@@ -37,7 +42,13 @@ jobs:
         run: make check-version
 
       - name: Build
-        run: make
+        run: make -j"$(nproc)"
 
-      - name: Run tests
+      - name: Filter conformance (unprivileged)
+        run: make check
+
+      - name: BPF program tests
         run: sudo ./test_bpf ebpfdivert.bpf.o
+
+      - name: Integration tests
+        run: sudo ./tests/run_integration_tests.sh
