@@ -58,6 +58,8 @@ dropping, makes TCP back off on every diverted segment.
   - A forwarded packet is one leaving an interface with `skb->ingress_ifindex != 0`.
   - When IP forwarding is enabled, ingress packets are also checked with `bpf_fib_lookup` so that NETWORK
     only sees locally delivered traffic.
+  - NETWORK_FORWARD captures at egress, after netfilter's FORWARD chain. Packets the firewall drops there
+    are never seen; this is common on Docker hosts, which set the FORWARD policy to DROP.
 - **Fragments.** Inbound fragments are only captured with `FRAGMENTS`. Rules cannot judge fragments, so
   they always go to user space for exact evaluation.
 - **Non-IP traffic** (ARP, LLDP, ...) is never captured.

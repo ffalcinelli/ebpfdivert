@@ -18,6 +18,14 @@ cd "$(dirname "$0")/.."
 
 FWD_V4=$(cat /proc/sys/net/ipv4/ip_forward)
 
+# NETWORK_FORWARD captures at TC egress, after netfilter's FORWARD chain.
+# Hosts running Docker set its policy to DROP, so let the test veths forward.
+forward_rules() {
+  command -v iptables >/dev/null || return 0
+  iptables "$1" FORWARD -i veth_test0 -o veth_test2 -j ACCEPT 2>/dev/null || true
+  iptables "$1" FORWARD -i veth_test2 -o veth_test0 -j ACCEPT 2>/dev/null || true
+}
+
 cleanup() {
   echo "Cleaning up interfaces and namespaces..."
   ip link delete veth_test0 2>/dev/null || true
@@ -25,6 +33,7 @@ cleanup() {
   ip netns delete ns1 2>/dev/null || true
   ip netns delete ns2 2>/dev/null || true
   echo "$FWD_V4" > /proc/sys/net/ipv4/ip_forward
+  forward_rules -D
   ./ebpfdivert-cli cleanup 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -53,6 +62,7 @@ ip netns exec ns2 ip link set lo up
 ip netns exec ns1 ip route add 10.200.2.0/24 via 10.200.1.1
 ip netns exec ns2 ip route add 10.200.1.0/24 via 10.200.2.1
 echo 1 > /proc/sys/net/ipv4/ip_forward
+forward_rules -I
 
 # Make sure aggregation is actually exercised.
 ethtool -K veth_test0 gro on tso on gso on 2>/dev/null || true
