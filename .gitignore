@@ -52,8 +52,8 @@ Mkfile.old
 dkms.conf
 
 # Development Environment
-.vagrant/
 .vscode/
+__pycache__/
 .idea/
 *.swp
 *~
