@@ -72,13 +72,14 @@ sudo ./test_bpf           # every WinDivert filter vector through the real BPF p
 sudo ./tests/run_integration_tests.sh   # namespaces/veth: divert, inject, GSO, forward, events, crashes
 ```
 
-Privileged tests are meant to run in the Vagrant VMs. `default` is Ubuntu 24.04 (kernel 6.8), and `legacy`
-is Ubuntu 22.04 (kernel 5.15):
+Privileged tests are meant to run in isolated QEMU/KVM VMs (`scripts/vm.py`) or a privileged Docker
+container (`scripts/test-docker.sh`, using the host kernel). `default` is Ubuntu 24.04 (kernel 6.8),
+and `legacy` is Ubuntu 22.04 (kernel 5.15, strictest eBPF verifier):
 
 ```bash
-vagrant up default && vagrant ssh default -c "cd /vagrant && make clean && make && ./test_filter && \
-    sudo ./test_bpf && sudo ./tests/run_integration_tests.sh"
-vagrant destroy -f default
+./scripts/test-docker.sh               # fast privileged run on the host kernel
+python3 scripts/vm.py run default      # Ubuntu 24.04 (kernel 6.8), destroys VM on exit
+python3 scripts/vm.py run legacy       # Ubuntu 22.04 (kernel 5.15), destroys VM on exit
 ```
 
 Release artifacts come from `scripts/build_release.sh`, run inside a `manylinux_2_28` container. The

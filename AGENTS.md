@@ -25,13 +25,13 @@ make check-version                         # EBPFDIVERT_VERSION vs. git tag
 sudo ./ebpfdivert-cli cleanup              # remove TC filters left by killed processes
 ```
 
-Run privileged tests in the Vagrant VMs, not on the host. `default` is Ubuntu 24.04 (kernel 6.8); `legacy` is
-Ubuntu 22.04 (kernel 5.15) and covers older verifiers:
+Run privileged tests in Docker (`./scripts/test-docker.sh`, host kernel) or the QEMU/KVM VMs
+(`scripts/vm.py`), not on the host. `default` is Ubuntu 24.04 (kernel 6.8); `legacy` is Ubuntu 22.04
+(kernel 5.15) and covers older verifiers:
 
 ```bash
-vagrant up default && vagrant ssh default -c "cd /vagrant && make clean && make && ./test_filter && \
-    sudo ./test_bpf && sudo ./tests/run_integration_tests.sh"
-vagrant destroy -f default
+./scripts/test-docker.sh
+python3 scripts/vm.py run default      # or `legacy`; destroys VM when finished
 ```
 
 CI (`.github/workflows/ci.yml`) runs the same build and tests on amd64 and arm64 runners. Release `.so` files
