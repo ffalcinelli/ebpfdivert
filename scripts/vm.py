@@ -195,17 +195,23 @@ def ssh_base(port: int) -> list[str]:
     ]
 
 
-def wait_for_ssh(port: int, pid: int, timeout: int = 300) -> None:
+# Wait for cloud-init (packages, the 9p mount), then check that the repository is mounted.
+PROBE = "cloud-init status --wait >/dev/null 2>&1; mountpoint -q /workspace && echo ready || echo nomount"
+
+
+def wait_for_ssh(port: int, pid: int, timeout: int = 1200) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not pid_alive(pid):
             sys.exit("QEMU exited unexpectedly while waiting for SSH. Check console.log.")
         res = subprocess.run(
-            [*ssh_base(port), "cloud-init status --wait >/dev/null 2>&1 || true; echo ready"],
+            [*ssh_base(port), PROBE],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
         )
+        if res.returncode == 0 and "nomount" in res.stdout:
+            sys.exit("cloud-init finished but /workspace is not mounted (9p); see console.log in the run dir.")
         if res.returncode == 0 and "ready" in res.stdout:
             return
         time.sleep(2)
@@ -255,7 +261,8 @@ def cmd_up(target: str) -> int:
         "virtio-net-pci,netdev=net0",
         "-virtfs",
         f"local,path={REPO_ROOT},mount_tag=workspace,security_model=mapped-xattr,id=workspace",
-        "-nographic",
+        "-display",
+        "none",
         "-daemonize",
         "-pidfile",
         str(pid_file),
