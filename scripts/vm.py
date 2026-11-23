@@ -331,7 +331,7 @@ def cmd_run(target: str, extra: list[str]) -> int:
             "sudo ./test_bpf ebpfdivert.bpf.o && "
             f"sudo ./tests/run_integration_tests.sh {quoted_args}"
         )
-        return cmd_exec(target, f"bash -lc {shlex.quote(script)}")
+        return cmd_exec(target, f"bash -c {shlex.quote(script)}")
     finally:
         cmd_destroy(target)
 
